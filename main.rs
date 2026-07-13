@@ -1,0 +1,70 @@
+// Define the Leaky Integrate-and-Fire neuron
+pub struct LifNeuron {
+    pub v_membrane: f32,    // Current membrane potential (mV)
+    pub v_rest: f32,        // Resting membrane potential (mV)
+    pub v_threshold: f32,   // Spike generation threshold (mV)
+    pub v_reset: f32,       // Potential after a spike occurs (mV)
+    pub tau_m: f32,         // Membrane time constant (ms)
+    pub is_refractory: bool,// Track if the neuron is in a refractory state
+}
+
+impl LifNeuron {
+    pub fn new(v_rest: f32, v_threshold: f32, v_reset: f32, tau_m: f32) -> Self {
+        Self {
+            v_membrane: v_rest,
+            v_rest,
+            v_threshold,
+            v_reset,
+            tau_m,
+            is_refractory: false,
+        }
+    }
+
+    pub fn step(&mut self, i_input: f32, dt: f32) -> bool {
+        if self.is_refractory {
+            self.is_refractory = false;
+            self.v_membrane = self.v_reset;
+            return false;
+        }
+
+        // Euler method integration: dv = (-(v - v_rest) + I) * (dt / tau_m)
+        let dv = (-(self.v_membrane - self.v_rest) + i_input) * (dt / self.tau_m);
+        self.v_membrane += dv;
+
+        if self.v_membrane >= self.v_threshold {
+            self.is_refractory = true;
+            true // Spike emitted!
+        } else {
+            false
+        }
+    }
+}
+
+fn main() {
+    // 1. Initialize neuron: rest=0mV, threshold=1.0mV, reset=0mV, tau_m=10.0ms
+    let mut neuron = LifNeuron::new(0.0, 1.0, 0.0, 10.0);
+    
+    // Simulation parameters
+    let dt = 1.0;            // 1 millisecond per timestep
+    let total_steps = 30;    // Simulate for 30 milliseconds
+    let injected_current = 0.35; // Steady current injected every step
+
+    println!("Simulating 30ms with constant current injection of {} mA:", injected_current);
+    println!("Time(ms) | Voltage(mV) | Action");
+    println!("---------------------------------");
+
+    // 2. Loop through time steps
+    for step in 1..=total_steps {
+        // Feed current into the neuron step function
+        let spiked = neuron.step(injected_current, dt);
+        
+        // Format a small text-based horizontal bar to visualize voltage
+        let visual_bar = "*".repeat((neuron.v_membrane.max(0.0) * 15.0) as usize);
+
+        if spiked {
+            println!("{:>-8} | {:>-11.2} | SPIKE! ⚡", step, neuron.v_membrane);
+        } else {
+            println!("{:>-8} | {:>-11.2} | {}", step, neuron.v_membrane, visual_bar);
+        }
+    }
+}

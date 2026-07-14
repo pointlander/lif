@@ -85,8 +85,10 @@ impl LifNeuron {
 fn main() {
     // 1. Initialize neuron: rest=0mV, threshold=1.0mV, reset=0mV, tau_m=10.0ms
     let mut neuron = LifNeuron::new(0.0, 1.0, 0.0, 10.0);
-    let mut input = RingBuffer::<f32, 8>::new();
-    let mut output = RingBuffer::<f32, 8>::new();
+    const LENGTH:usize = 8;
+    let mut input = RingBuffer::<f32, LENGTH>::new();
+    let mut output = RingBuffer::<f32, LENGTH>::new();
+    let mut cost = RingBuffer::<f32, LENGTH>::new();
     
     // Simulation parameters
     let dt = 1.0;            // 1 millisecond per timestep
@@ -112,6 +114,11 @@ fn main() {
             println!("{:>-8} | {:>-11.2} | {}", step, neuron.v_membrane, visual_bar);
         }
         output.push(neuron.v_membrane);
+        let mut diff = input.buffer[(LENGTH-2+LENGTH)%LENGTH].unwrap_or(0.0) - input.buffer[(LENGTH-1+LENGTH)%LENGTH].unwrap_or(0.0);
+        if diff < 0.0 {
+        	diff = -diff;
+        }
+        cost.push(diff);
         println!("{:?}", input.buffer);
         println!("{:?}", output.buffer);
     }

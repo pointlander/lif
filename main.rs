@@ -1,3 +1,45 @@
+pub struct RingBuffer<T, const N: usize> {
+    buffer: [Option<T>; N],
+    write_idx: usize,
+    read_idx: usize,
+    size: usize,
+}
+
+impl<T, const N: usize> RingBuffer<T, N> {
+    pub fn new() -> Self {
+        // Initialize an empty array using const expressions
+        Self {
+            buffer: [const { None }; N],
+            write_idx: 0,
+            read_idx: 0,
+            size: 0,
+        }
+    }
+
+    pub fn push(&mut self, item: T) {
+        if self.size == N {
+            // Buffer is full; advance read index to overwrite the oldest item
+            self.read_idx = (self.read_idx + 1) % N;
+            self.size -= 1;
+        }
+        
+        self.buffer[self.write_idx] = Some(item);
+        self.write_idx = (self.write_idx + 1) % N;
+        self.size += 1;
+    }
+
+    pub fn pop(&mut self) -> Option<T> {
+        if self.size == 0 {
+            return None;
+        }
+
+        let item = self.buffer[self.read_idx].take();
+        self.read_idx = (self.read_idx + 1) % N;
+        self.size -= 1;
+        item
+    }
+}
+
 // Define the Leaky Integrate-and-Fire neuron
 pub struct LifNeuron {
     pub v_membrane: f32,    // Current membrane potential (mV)
@@ -43,6 +85,8 @@ impl LifNeuron {
 fn main() {
     // 1. Initialize neuron: rest=0mV, threshold=1.0mV, reset=0mV, tau_m=10.0ms
     let mut neuron = LifNeuron::new(0.0, 1.0, 0.0, 10.0);
+    let mut input = RingBuffer::<f32, 8>::new();
+    let mut output = RingBuffer::<f32, 8>::new();
     
     // Simulation parameters
     let dt = 1.0;            // 1 millisecond per timestep
@@ -55,6 +99,7 @@ fn main() {
 
     // 2. Loop through time steps
     for step in 1..=total_steps {
+    	input.push(injected_current);
         // Feed current into the neuron step function
         let spiked = neuron.step(injected_current, dt);
         
@@ -66,5 +111,8 @@ fn main() {
         } else {
             println!("{:>-8} | {:>-11.2} | {}", step, neuron.v_membrane, visual_bar);
         }
+        output.push(neuron.v_membrane);
+        println!("{:?}", input.buffer);
+        println!("{:?}", output.buffer);
     }
 }

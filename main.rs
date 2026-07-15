@@ -140,7 +140,8 @@ fn main() {
     println!("{:?} {:?}", count, u32::MAX);
 
 	lfsr = 1;
-	for _step in 1..=30{
+	let mut z:[f64; 256] = [0.0; 256];
+	for step in 0..128{
     	lfsr = (lfsr >> 1) ^ ((!(lfsr & 1)).wrapping_add(1) & LFSRMASK);
     	println!("{:?}", lfsr);
     	let u1 = lfsr as f64 / 4294967295.0;
@@ -154,5 +155,22 @@ fn main() {
     	let z0 = r * theta.cos();
     	let z1 = r * theta.sin();
     	println!("{:.10} {:.10}", z0, z1);
+    	z[step*2] = z0;
+    	z[step*2+1] = z1;
     }
+
+    let mut avg = 0.0;
+    for value in z {
+    	avg += value;
+    }
+    avg = avg/256.0;
+    println!("{:.10}", avg);
+    let mut stddev = 0.0;
+	for value in z {
+		let diff = value - avg;
+		stddev += diff*diff;
+	}
+	stddev = stddev/256.0;
+	stddev = stddev.sqrt();
+	println!("{:10}", stddev);
 }

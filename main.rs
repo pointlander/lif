@@ -5,6 +5,17 @@ pub struct RingBuffer<T, const N: usize> {
     size: usize,
 }
 
+impl<T, const N: usize> Default for RingBuffer<T, N> {
+    fn default() -> Self {
+        Self {
+            buffer: core::array::from_fn(|_| None),
+            write_idx: 0,
+            read_idx: 0,
+            size: 0,
+        }
+    }
+}
+
 impl<T, const N: usize> RingBuffer<T, N> {
     pub fn new() -> Self {
         // Initialize an empty array using const expressions
@@ -86,6 +97,103 @@ impl LifNeuron {
     }
 }
 
+// Rand is a random number generator
+pub struct Rand {
+	pub lfsr: u32,
+}
+
+// LFSRMASK is the lfsr polynomial
+const LFSRMASK:u32 = 0x80000057;
+
+impl Rand {
+	pub fn new(seed: u32) -> Rand {
+		Rand { lfsr: seed }
+	}
+
+	pub fn u32(&mut self) -> u32 {
+		self.lfsr = (self.lfsr >> 1) ^ ((!(self.lfsr & 1)).wrapping_add(1) & LFSRMASK);
+		self.lfsr
+	}
+
+	pub fn u(&mut self) -> f32 {
+		self.u32() as f32 / u32::MAX as f32
+	}
+
+	pub fn g(&mut self) -> (f32, f32) {
+		let u1 = self.u();
+		let u2 = self.u();
+		let r = (-2.0 * u1.ln()).sqrt();
+		let theta = 2.0 * 3.1459 * u2;
+		let z0 = r * theta.cos();
+		let z1 = r * theta.sin();
+		(z0, z1)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*; // Brings the outer functions into scope
+
+    #[test]
+    fn test_lfsr() {
+    	let mut lfsr = Rand::new(1);
+		let mut count:u64 = 1;
+		loop {
+			let s = lfsr.u32();
+			if s == 1 {
+				break;
+			}
+			count += 1;
+		}
+        assert_eq!(count, u32::MAX as u64);
+    }
+
+    
+	#[test]
+	fn test_g() {
+		let mut lfsr = Rand::new(1);
+		let mut za:[f32; 128] = [0.0; 128];
+		let mut zb:[f32; 128] = [0.0; 128];
+		for step in 0..128 {
+			let (z0, z1) = lfsr.g();
+			za[step] = z0;
+			zb[step] = z1;
+		}
+		{
+			let mut avg = 0.0;
+			for value in za {
+				avg += value;
+			}
+			avg /= 128.0;
+			let mut stddev = 0.0;
+			for value in za {
+				let diff = value - avg;
+				stddev += diff*diff;
+			}
+			stddev /= 128.0;
+			stddev = stddev.sqrt();
+			assert_eq!(((100.0 * avg)/100.0).round(), 0.0);
+			assert_eq!(((100.0 * stddev)/100.0).round(), 1.0);
+		}
+		{
+			let mut avg = 0.0;
+			for value in zb {
+				avg += value;
+			}
+			avg /= 128.0;
+			let mut stddev = 0.0;
+			for value in zb {
+				let diff = value - avg;
+				stddev += diff*diff;
+			}
+			stddev /= 128.0;
+			stddev = stddev.sqrt();
+			assert_eq!(((100.0 * avg)/100.0).round(), 0.0);
+			assert_eq!(((100.0 * stddev)/100.0).round(), 1.0);
+		}
+	}
+}
+
 fn main() {
     // 1. Initialize neuron: rest=0mV, threshold=1.0mV, reset=0mV, tau_m=10.0ms
     let mut neuron = LifNeuron::new(0.0, 1.0, 0.0, 10.0);
@@ -126,51 +234,4 @@ fn main() {
         println!("{:?}", input.buffer);
         println!("{:?}", output.buffer);
     }
-
-    const LFSRMASK:u32 = 0x80000057;
-    let mut lfsr:u32 = 1;
-    let mut count:u64 = 0;
-    loop {
-    	lfsr = (lfsr >> 1) ^ ((!(lfsr & 1)).wrapping_add(1) & LFSRMASK);
-    	if lfsr == 1 {
-    		break;
-    	}
-    	count += 1;
-    }
-    println!("{:?} {:?}", count, u32::MAX);
-
-	lfsr = 1;
-	let mut z:[f64; 256] = [0.0; 256];
-	for step in 0..128{
-    	lfsr = (lfsr >> 1) ^ ((!(lfsr & 1)).wrapping_add(1) & LFSRMASK);
-    	println!("{:?}", lfsr);
-    	let u1 = lfsr as f64 / 4294967295.0;
-    	lfsr = (lfsr >> 1) ^ ((!(lfsr & 1)).wrapping_add(1) & LFSRMASK);
-    	println!("{:?}", lfsr);
-    	let u2 = lfsr as f64 / 4294967295.0;
-    	println!("{:.10} {:.10}", u1, u2);
-
-    	let r = (-2.0 * u1.ln()).sqrt();
-    	let theta = 2.0 * 3.1459 * u2;
-    	let z0 = r * theta.cos();
-    	let z1 = r * theta.sin();
-    	println!("{:.10} {:.10}", z0, z1);
-    	z[step*2] = z0;
-    	z[step*2+1] = z1;
-    }
-
-    let mut avg = 0.0;
-    for value in z {
-    	avg += value;
-    }
-    avg = avg/256.0;
-    println!("{:.10}", avg);
-    let mut stddev = 0.0;
-	for value in z {
-		let diff = value - avg;
-		stddev += diff*diff;
-	}
-	stddev = stddev/256.0;
-	stddev = stddev.sqrt();
-	println!("{:10}", stddev);
 }

@@ -44,7 +44,9 @@ impl<T, const N: usize> RingBuffer<T, N> {
 pub struct LifNeuron {
     pub v_membrane: f32,    // Current membrane potential (mV)
     pub v_rest: f32,        // Resting membrane potential (mV)
+    pub v_rest_stddev: f32,
     pub v_threshold: f32,   // Spike generation threshold (mV)
+    pub v_threshold_stddev: f32,
     pub v_reset: f32,       // Potential after a spike occurs (mV)
     pub tau_m: f32,         // Membrane time constant (ms)
     pub is_refractory: bool,// Track if the neuron is in a refractory state
@@ -55,7 +57,9 @@ impl LifNeuron {
         Self {
             v_membrane: v_rest,
             v_rest,
+            v_rest_stddev: 0.1,
             v_threshold,
+            v_threshold_stddev: 0.1,
             v_reset,
             tau_m,
             is_refractory: false,
@@ -121,5 +125,34 @@ fn main() {
         cost.push(diff);
         println!("{:?}", input.buffer);
         println!("{:?}", output.buffer);
+    }
+
+    const LFSRMASK:u32 = 0x80000057;
+    let mut lfsr:u32 = 1;
+    let mut count:u64 = 0;
+    loop {
+    	lfsr = (lfsr >> 1) ^ ((!(lfsr & 1)).wrapping_add(1) & LFSRMASK);
+    	if lfsr == 1 {
+    		break;
+    	}
+    	count += 1;
+    }
+    println!("{:?} {:?}", count, u32::MAX);
+
+	lfsr = 1;
+	for _step in 1..=30{
+    	lfsr = (lfsr >> 1) ^ ((!(lfsr & 1)).wrapping_add(1) & LFSRMASK);
+    	println!("{:?}", lfsr);
+    	let u1 = lfsr as f64 / 4294967295.0;
+    	lfsr = (lfsr >> 1) ^ ((!(lfsr & 1)).wrapping_add(1) & LFSRMASK);
+    	println!("{:?}", lfsr);
+    	let u2 = lfsr as f64 / 4294967295.0;
+    	println!("{:.10} {:.10}", u1, u2);
+
+    	let r = (-2.0 * u1.ln()).sqrt();
+    	let theta = 2.0 * 3.1459 * u2;
+    	let z0 = r * theta.cos();
+    	let z1 = r * theta.sin();
+    	println!("{:.10} {:.10}", z0, z1);
     }
 }

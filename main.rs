@@ -151,10 +151,11 @@ mod tests {
     
 	#[test]
 	fn test_g() {
+		const LENGTH:usize = 8*1024;
 		let mut lfsr = Rand::new(1);
-		let mut za:[f32; 128] = [0.0; 128];
-		let mut zb:[f32; 128] = [0.0; 128];
-		for step in 0..128 {
+		let mut za:[f32; LENGTH] = [0.0; LENGTH];
+		let mut zb:[f32; LENGTH] = [0.0; LENGTH];
+		for step in 0..LENGTH {
 			let (z0, z1) = lfsr.g();
 			za[step] = z0;
 			zb[step] = z1;
@@ -164,13 +165,13 @@ mod tests {
 			for value in za {
 				avg += value;
 			}
-			avg /= 128.0;
+			avg /= LENGTH as f32;
 			let mut stddev = 0.0;
 			for value in za {
 				let diff = value - avg;
 				stddev += diff*diff;
 			}
-			stddev /= 128.0;
+			stddev /= LENGTH as f32;
 			stddev = stddev.sqrt();
 			assert_eq!(avg.round(), 0.0);
 			assert_eq!(stddev.round(), 1.0);
@@ -180,13 +181,13 @@ mod tests {
 			for value in zb {
 				avg += value;
 			}
-			avg /= 128.0;
+			avg /= LENGTH as f32;
 			let mut stddev = 0.0;
 			for value in zb {
 				let diff = value - avg;
 				stddev += diff*diff;
 			}
-			stddev /= 128.0;
+			stddev /= LENGTH as f32;
 			stddev = stddev.sqrt();
 			assert_eq!(avg.round(), 0.0);
 			assert_eq!(stddev.round(), 1.0);

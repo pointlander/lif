@@ -172,8 +172,8 @@ mod tests {
 			}
 			stddev /= 128.0;
 			stddev = stddev.sqrt();
-			assert_eq!(((100.0 * avg)/100.0).round(), 0.0);
-			assert_eq!(((100.0 * stddev)/100.0).round(), 1.0);
+			assert_eq!(avg.round(), 0.0);
+			assert_eq!(stddev.round(), 1.0);
 		}
 		{
 			let mut avg = 0.0;
@@ -188,8 +188,8 @@ mod tests {
 			}
 			stddev /= 128.0;
 			stddev = stddev.sqrt();
-			assert_eq!(((100.0 * avg)/100.0).round(), 0.0);
-			assert_eq!(((100.0 * stddev)/100.0).round(), 1.0);
+			assert_eq!(avg.round(), 0.0);
+			assert_eq!(stddev.round(), 1.0);
 		}
 	}
 }

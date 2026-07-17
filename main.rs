@@ -58,14 +58,18 @@ pub struct LifNeuron {
     pub v_membrane: f32,    // Current membrane potential (mV)
     pub v_rest: f32,        // Resting membrane potential (mV)
     pub v_rest_stddev: f32,
+    pub v_rest_buffer: RingBuffer::<f32, LENGTH>,
     pub v_threshold: f32,   // Spike generation threshold (mV)
     pub v_threshold_stddev: f32,
+    pub v_threshold_buffer: RingBuffer::<f32, LENGTH>,
     pub v_reset: f32,       // Potential after a spike occurs (mV)
     pub tau_m: f32,         // Membrane time constant (ms)
     pub is_refractory: bool,// Track if the neuron is in a refractory state
     pub input: RingBuffer::<f32, LENGTH>,
     pub output: RingBuffer::<f32, LENGTH>,
     pub fitness: RingBuffer::<f32, LENGTH>,
+    pub iteration: u64,
+    pub rng: Rand,
 }
 
 impl LifNeuron {
@@ -74,14 +78,18 @@ impl LifNeuron {
             v_membrane: v_rest,
             v_rest,
             v_rest_stddev: 0.1,
+            v_rest_buffer: RingBuffer::<f32, LENGTH>::new(),
             v_threshold,
             v_threshold_stddev: 0.1,
+            v_threshold_buffer: RingBuffer::<f32, LENGTH>::new(),
             v_reset,
             tau_m,
             is_refractory: false,
             input: RingBuffer::<f32, LENGTH>::new(),
             output: RingBuffer::<f32, LENGTH>::new(),
             fitness: RingBuffer::<f32, LENGTH>::new(),
+            iteration: 0,
+            rng: Rand::new(1),
         }
     }
 
@@ -93,8 +101,12 @@ impl LifNeuron {
             return false;
         }
 
+		let (z0, _) = self.rng.g();
+		let v_rest = z0*self.v_rest_stddev + self.v_rest;
+		self.v_rest_buffer.push(v_rest);
+
         // Euler method integration: dv = (-(v - v_rest) + I) * (dt / tau_m)
-        let dv = (-(self.v_membrane - self.v_rest) + i_input) * (dt / self.tau_m);
+        let dv = (-(self.v_membrane - v_rest) + i_input) * (dt / self.tau_m);
         self.v_membrane += dv;
 
 		self.output.push(self.v_membrane);
@@ -103,7 +115,70 @@ impl LifNeuron {
 			diff = -diff;
 		}
 		self.fitness.push(diff);
-        if self.v_membrane >= self.v_threshold {
+
+		let (z0, _) = self.rng.g();
+		let v_threshold = z0*self.v_threshold_stddev + self.v_threshold;
+		self.v_threshold_buffer.push(v_threshold);
+
+		self.iteration += 1;
+		if self.iteration == LENGTH as u64 {
+			self.iteration = 0;
+			let mut swapped = true;    
+			while swapped {
+				swapped = false;
+				// Loop through the slice, stopping at the second-to-last element
+				for i in 0..self.fitness.buffer.len().saturating_sub(1) {
+					if self.fitness.buffer[i] < self.fitness.buffer[i + 1] {
+						self.fitness.buffer.swap(i, i + 1);
+						self.v_rest_buffer.buffer.swap(i, i + 1);
+						self.v_threshold_buffer.buffer.swap(i, i+1);
+						swapped = true; // Set to true to trigger another pass
+					}
+				}
+			}
+			{
+				let length = self.v_rest_buffer.buffer.len()/2;
+				let mut avg = 0.0;
+				for i in 0..length {
+					avg += self.v_rest_buffer.buffer[i].unwrap_or(0.0);
+				}
+				avg /= length as f32;
+				let mut stddev = 0.0;
+				for i in 0..length {
+					let diff = self.v_rest_buffer.buffer[i].unwrap_or(0.0) - avg;
+					stddev += diff*diff;
+				}
+				stddev /= length as f32;
+				stddev = stddev.sqrt();
+				self.v_rest = avg;
+				if stddev < 0.01 {
+					stddev = 0.01;
+				}
+				self.v_rest_stddev = stddev;
+			}
+			{
+				let length = self.v_threshold_buffer.buffer.len()/2;
+				let mut avg = 0.0;
+				for i in 0..length {
+					avg += self.v_threshold_buffer.buffer[i].unwrap_or(0.0);
+				}
+				avg /= length as f32;
+				let mut stddev = 0.0;
+				for i in 0..length {
+					let diff = self.v_threshold_buffer.buffer[i].unwrap_or(0.0) - avg;
+					stddev += diff*diff;
+				}
+				stddev /= length as f32;
+				stddev = stddev.sqrt();
+				self.v_threshold = avg;
+				if stddev < 0.01 {
+					stddev = 0.01;
+				}
+				self.v_threshold_stddev = stddev;
+			}
+		}
+
+        if self.v_membrane >= v_threshold {
             self.is_refractory = true;
             true // Spike emitted!
         } else {
@@ -215,9 +290,9 @@ fn main() {
     let mut neuron = LifNeuron::new(0.0, 1.0, 0.0, 10.0);
     
     // Simulation parameters
-    let dt = 1.0;            // 1 millisecond per timestep
-    let total_steps = 30;    // Simulate for 30 milliseconds
-    let injected_current = 0.35; // Steady current injected every step
+    let dt = 10.0;            // 1 millisecond per timestep
+    let total_steps = 128;    // Simulate for 30 milliseconds
+    let mut injected_current = 1.0; // Steady current injected every step
 
     println!("Simulating 30ms with constant current injection of {} mA:", injected_current);
     println!("Time(ms) | Voltage(mV) | Action");
@@ -232,12 +307,16 @@ fn main() {
         let visual_bar = "*".repeat((neuron.v_membrane.max(0.0) * 15.0) as usize);
 
         if spiked {
-            println!("{:>-8} | {:>-11.2} | SPIKE! ⚡", step, neuron.v_membrane);
+            println!("{:>-8} | {:>-11.2} | SPIKE! ⚡", step, neuron.v_threshold_stddev);
         } else {
-            println!("{:>-8} | {:>-11.2} | {}", step, neuron.v_membrane, visual_bar);
+            println!("{:>-8} | {:>-11.2} | {}", step, neuron.v_threshold_stddev, visual_bar);
         }
-        
-        println!("{:?}", neuron.input.buffer);
-        println!("{:?}", neuron.output.buffer);
+        if injected_current == 1.0 {
+        	injected_current = 0.0;
+        } else {
+        	injected_current = 1.0;
+        }
+        //println!("{:?}", neuron.input.buffer);
+        //println!("{:?}", neuron.output.buffer);
     }
 }

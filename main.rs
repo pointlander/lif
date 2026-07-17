@@ -51,6 +51,8 @@ impl<T, const N: usize> RingBuffer<T, N> {
     }
 }
 
+const LENGTH:usize = 8;
+
 // Define the Leaky Integrate-and-Fire neuron
 pub struct LifNeuron {
     pub v_membrane: f32,    // Current membrane potential (mV)
@@ -61,6 +63,9 @@ pub struct LifNeuron {
     pub v_reset: f32,       // Potential after a spike occurs (mV)
     pub tau_m: f32,         // Membrane time constant (ms)
     pub is_refractory: bool,// Track if the neuron is in a refractory state
+    pub input: RingBuffer::<f32, LENGTH>,
+    pub output: RingBuffer::<f32, LENGTH>,
+    pub fitness: RingBuffer::<f32, LENGTH>,
 }
 
 impl LifNeuron {
@@ -74,10 +79,14 @@ impl LifNeuron {
             v_reset,
             tau_m,
             is_refractory: false,
+            input: RingBuffer::<f32, LENGTH>::new(),
+            output: RingBuffer::<f32, LENGTH>::new(),
+            fitness: RingBuffer::<f32, LENGTH>::new(),
         }
     }
 
     pub fn step(&mut self, i_input: f32, dt: f32) -> bool {
+    	self.input.push(i_input);
         if self.is_refractory {
             self.is_refractory = false;
             self.v_membrane = self.v_reset;
@@ -88,6 +97,12 @@ impl LifNeuron {
         let dv = (-(self.v_membrane - self.v_rest) + i_input) * (dt / self.tau_m);
         self.v_membrane += dv;
 
+		self.output.push(self.v_membrane);
+		let mut diff = self.input.buffer[(LENGTH-2+LENGTH)%LENGTH].unwrap_or(0.0) - self.output.buffer[(LENGTH-1+LENGTH)%LENGTH].unwrap_or(0.0);
+		if diff < 0.0 {
+			diff = -diff;
+		}
+		self.fitness.push(diff);
         if self.v_membrane >= self.v_threshold {
             self.is_refractory = true;
             true // Spike emitted!
@@ -198,10 +213,6 @@ mod tests {
 fn main() {
     // 1. Initialize neuron: rest=0mV, threshold=1.0mV, reset=0mV, tau_m=10.0ms
     let mut neuron = LifNeuron::new(0.0, 1.0, 0.0, 10.0);
-    const LENGTH:usize = 8;
-    let mut input = RingBuffer::<f32, LENGTH>::new();
-    let mut output = RingBuffer::<f32, LENGTH>::new();
-    let mut cost = RingBuffer::<f32, LENGTH>::new();
     
     // Simulation parameters
     let dt = 1.0;            // 1 millisecond per timestep
@@ -214,7 +225,6 @@ fn main() {
 
     // 2. Loop through time steps
     for step in 1..=total_steps {
-    	input.push(injected_current);
         // Feed current into the neuron step function
         let spiked = neuron.step(injected_current, dt);
         
@@ -226,13 +236,8 @@ fn main() {
         } else {
             println!("{:>-8} | {:>-11.2} | {}", step, neuron.v_membrane, visual_bar);
         }
-        output.push(neuron.v_membrane);
-        let mut diff = input.buffer[(LENGTH-2+LENGTH)%LENGTH].unwrap_or(0.0) - input.buffer[(LENGTH-1+LENGTH)%LENGTH].unwrap_or(0.0);
-        if diff < 0.0 {
-        	diff = -diff;
-        }
-        cost.push(diff);
-        println!("{:?}", input.buffer);
-        println!("{:?}", output.buffer);
+        
+        println!("{:?}", neuron.input.buffer);
+        println!("{:?}", neuron.output.buffer);
     }
 }

@@ -299,6 +299,7 @@ fn main() {
     println!("---------------------------------");
 
     // 2. Loop through time steps
+    let mut score:f32 = 0.0;
     for step in 1..=total_steps {
         // Feed current into the neuron step function
         let spiked = neuron.step(injected_current, dt);
@@ -316,7 +317,11 @@ fn main() {
         } else {
         	injected_current = 1.0;
         }
+        for i in 0..LENGTH {
+        	score += neuron.fitness.buffer[i].unwrap_or(0.0);
+        }
         //println!("{:?}", neuron.input.buffer);
         //println!("{:?}", neuron.output.buffer);
     }
+    println!("{{score: {:?}}}", score)
 }

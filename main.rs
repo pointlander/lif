@@ -87,6 +87,13 @@ impl<T, const N: usize> RingBuffer<T, N> {
         item
     }
 
+    pub fn clear(&mut self) {
+        self.buffer = [const { None }; N];
+        self.write_idx = 0;
+        self.read_idx = 0;
+        self.size = 0;
+    }
+
     /// Sum of all stored values (chronological order is irrelevant for a sum).
     pub fn sum(&self) -> f32
     where
@@ -113,75 +120,255 @@ impl<T: Copy, const N: usize> RingBuffer<T, N> {
     }
 }
 
-const LENGTH: usize = 8;
+/// Population size for one CEM generation (completed episodes).
+const POP_SIZE: usize = 8;
+/// Wall-clock steps per episode with fixed sampled parameters
+/// (includes refractory steps so generation rate stays predictable).
+const EPISODE_LEN: usize = 4;
+/// Number of top episodes used for the distribution update.
+const ELITE_COUNT: usize = 4;
+
+/// Soft-update rates toward elite statistics (0 = freeze, 1 = hard replace).
+const LR_MEAN: f32 = 0.65;
+const LR_STD: f32 = 0.45;
+/// Keep exploration alive; clamp explosion.
+const STD_MIN: f32 = 0.05;
+const STD_MAX: f32 = 2.0;
+/// Extra cost when a spike resets the membrane during tracking.
+const SPIKE_PENALTY: f32 = 1.5;
+/// Mild preference for small |v_rest| (steady-state V ≈ v_rest + I tracks I best at 0).
+const V_REST_L2: f32 = 0.01;
+
+/// Diagonal Gaussian over one learnable scalar.
+#[derive(Clone, Copy, Debug)]
+pub struct GaussianParam {
+    pub mean: f32,
+    pub stddev: f32,
+}
+
+impl GaussianParam {
+    pub fn new(mean: f32, stddev: f32) -> Self {
+        Self {
+            mean,
+            stddev: stddev.clamp(STD_MIN, STD_MAX),
+        }
+    }
+
+    pub fn sample(&self, z: f32) -> f32 {
+        self.mean + z * self.stddev
+    }
+
+    /// CEM soft update from rank-weighted elite samples.
+    pub fn update_from_elites(&mut self, elite_values: &[f32], weights: &[f32]) {
+        debug_assert_eq!(elite_values.len(), weights.len());
+        if elite_values.is_empty() {
+            return;
+        }
+
+        let mut w_mean = 0.0;
+        let mut w_sum = 0.0;
+        for (&x, &w) in elite_values.iter().zip(weights.iter()) {
+            w_mean += w * x;
+            w_sum += w;
+        }
+        w_mean /= w_sum.max(1e-8);
+
+        let mut w_var = 0.0;
+        for (&x, &w) in elite_values.iter().zip(weights.iter()) {
+            let d = x - w_mean;
+            w_var += w * d * d;
+        }
+        w_var /= w_sum.max(1e-8);
+        let elite_std = w_var.sqrt();
+
+        let old_mean = self.mean;
+        self.mean = (1.0 - LR_MEAN) * self.mean + LR_MEAN * w_mean;
+        // Keep exploration alive while the mean is still traveling; pure elite
+        // variance collapses when the whole population sits in a bad cluster.
+        let travel = (self.mean - old_mean).abs();
+        let target_std = elite_std.max(travel).max(STD_MIN);
+        self.stddev =
+            ((1.0 - LR_STD) * self.stddev + LR_STD * target_std).clamp(STD_MIN, STD_MAX);
+    }
+}
+
+/// Log-rank weights for elites (best index 0). Higher weight on better ranks.
+/// Classic CEM/CMA positive weights: w_i ∝ log(λ+½) − log(i+1), normalized.
+fn elite_rank_weights(elite_n: usize, out: &mut [f32]) {
+    assert!(elite_n <= out.len());
+    if elite_n == 0 {
+        return;
+    }
+    let mut sum = 0.0;
+    for i in 0..elite_n {
+        let w = (elite_n as f32 + 0.5).ln() - ((i + 1) as f32).ln();
+        out[i] = w.max(0.0);
+        sum += out[i];
+    }
+    if sum <= 0.0 {
+        let u = 1.0 / elite_n as f32;
+        for i in 0..elite_n {
+            out[i] = u;
+        }
+    } else {
+        for i in 0..elite_n {
+            out[i] /= sum;
+        }
+    }
+}
 
 // Define the Leaky Integrate-and-Fire neuron
 pub struct LifNeuron {
-    pub v_membrane: f32, // Current membrane potential (mV)
-    pub v_rest: f32,     // Resting membrane potential (mV)
-    pub v_rest_stddev: f32,
-    pub v_rest_buffer: RingBuffer<f32, LENGTH>,
-    pub v_threshold: f32, // Spike generation threshold (mV)
-    pub v_threshold_stddev: f32,
-    pub v_threshold_buffer: RingBuffer<f32, LENGTH>,
-    pub v_reset: f32, // Potential after a spike occurs (mV)
-    pub tau_m: f32,   // Membrane time constant (ms)
-    pub is_refractory: bool, // Track if the neuron is in a refractory state
-    pub input: RingBuffer<f32, LENGTH>,
-    pub output: RingBuffer<f32, LENGTH>,
-    pub fitness: RingBuffer<f32, LENGTH>,
-    pub iteration: u64,
+    pub v_membrane: f32,
+    pub v_reset: f32,
+    pub tau_m: f32,
+    pub is_refractory: bool,
+
+    /// Search distribution over resting potential.
+    pub v_rest_dist: GaussianParam,
+    /// Search distribution over spike threshold.
+    pub v_threshold_dist: GaussianParam,
+
+    /// Parameters active for the current episode.
+    pub trial_v_rest: f32,
+    pub trial_v_threshold: f32,
+    /// Antithetic partner for the next episode (reduces gradient noise).
+    pending_antithetic: Option<(f32, f32)>,
+
+    /// Per-step I/O history (for inspection / scoring).
+    pub input: RingBuffer<f32, POP_SIZE>,
+    pub output: RingBuffer<f32, POP_SIZE>,
+    /// Completed-episode fitness population for CEM.
+    pub episode_fitness: RingBuffer<f32, POP_SIZE>,
+    pub episode_v_rest: RingBuffer<f32, POP_SIZE>,
+    pub episode_v_threshold: RingBuffer<f32, POP_SIZE>,
+
+    /// Accumulators for the open episode.
+    episode_error_sum: f32,
+    episode_spike_count: u32,
+    episode_step: u32,
+    pub generation: u64,
+    /// Last generation's mean episode fitness (for monitoring).
+    pub last_gen_fitness: f32,
     pub rng: Rand,
 }
 
 impl LifNeuron {
     pub fn new(v_rest: f32, v_threshold: f32, v_reset: f32, tau_m: f32) -> Self {
-        Self {
+        let mut neuron = Self {
             v_membrane: v_rest,
-            v_rest,
-            v_rest_stddev: 0.1,
-            v_rest_buffer: RingBuffer::<f32, LENGTH>::new(),
-            v_threshold,
-            v_threshold_stddev: 0.1,
-            v_threshold_buffer: RingBuffer::<f32, LENGTH>::new(),
             v_reset,
             tau_m,
             is_refractory: false,
-            input: RingBuffer::<f32, LENGTH>::new(),
-            output: RingBuffer::<f32, LENGTH>::new(),
-            fitness: RingBuffer::<f32, LENGTH>::new(),
-            iteration: 0,
+            v_rest_dist: GaussianParam::new(v_rest, 0.8),
+            v_threshold_dist: GaussianParam::new(v_threshold, 0.8),
+            trial_v_rest: v_rest,
+            trial_v_threshold: v_threshold,
+            pending_antithetic: None,
+            input: RingBuffer::new(),
+            output: RingBuffer::new(),
+            episode_fitness: RingBuffer::new(),
+            episode_v_rest: RingBuffer::new(),
+            episode_v_threshold: RingBuffer::new(),
+            episode_error_sum: 0.0,
+            episode_spike_count: 0,
+            episode_step: 0,
+            generation: 0,
+            last_gen_fitness: f32::INFINITY,
             rng: Rand::new(1),
+        };
+        neuron.resample_trial();
+        neuron
+    }
+
+    pub fn v_rest(&self) -> f32 {
+        self.v_rest_dist.mean
+    }
+
+    pub fn v_threshold(&self) -> f32 {
+        self.v_threshold_dist.mean
+    }
+
+    pub fn v_rest_stddev(&self) -> f32 {
+        self.v_rest_dist.stddev
+    }
+
+    pub fn v_threshold_stddev(&self) -> f32 {
+        self.v_threshold_dist.stddev
+    }
+
+    /// Start a new episode: antithetic pair if available, else fresh Gaussian sample.
+    fn resample_trial(&mut self) {
+        if let Some((rest, thr)) = self.pending_antithetic.take() {
+            self.trial_v_rest = rest;
+            self.trial_v_threshold = thr;
+            return;
         }
+
+        let (z0, z1) = self.rng.g();
+        self.trial_v_rest = self.v_rest_dist.sample(z0);
+        self.trial_v_threshold = self.v_threshold_dist.sample(z1).max(self.v_reset + 0.05);
+
+        // Antithetic twin mirrors the noise for the following episode.
+        self.pending_antithetic = Some((
+            self.v_rest_dist.sample(-z0),
+            self.v_threshold_dist
+                .sample(-z1)
+                .max(self.v_reset + 0.05),
+        ));
     }
 
-    /// Fitness = absolute tracking error between input and membrane voltage.
-    /// Uses same-timestep samples so parallel buffers stay aligned.
-    fn tracking_error(input: f32, output: f32) -> f32 {
-        (input - output).abs()
+    /// Episode cost: mean squared tracking error + spike disruption + mild prior.
+    fn episode_fitness_value(&self) -> f32 {
+        let steps = self.episode_step.max(1) as f32;
+        let mse = self.episode_error_sum / steps;
+        let spike_cost = SPIKE_PENALTY * self.episode_spike_count as f32 / steps;
+        let prior = V_REST_L2 * self.trial_v_rest * self.trial_v_rest;
+        mse + spike_cost + prior
     }
 
-    /// Select the best half of recent trials (lowest error) and update
-    /// `v_rest` / `v_threshold` mean + stddev. Leaves ring order intact.
-    fn adapt_from_elites(&mut self) {
-        let n = self.fitness.len();
+    fn finish_episode(&mut self) {
+        let fitness = self.episode_fitness_value();
+        self.episode_fitness.push(fitness);
+        self.episode_v_rest.push(self.trial_v_rest);
+        self.episode_v_threshold.push(self.trial_v_threshold);
+
+        self.episode_error_sum = 0.0;
+        self.episode_spike_count = 0;
+        self.episode_step = 0;
+
+        if self.episode_fitness.len() >= POP_SIZE {
+            self.cem_update();
+        }
+
+        self.resample_trial();
+    }
+
+    /// Cross-entropy method with log-rank elite weights and soft Gaussian updates.
+    fn cem_update(&mut self) {
+        let n = self.episode_fitness.len();
         if n == 0 {
             return;
         }
 
-        // Indices into chronological order (0 = oldest).
-        let mut order = [0usize; LENGTH];
+        let mut order = [0usize; POP_SIZE];
         for i in 0..n {
             order[i] = i;
         }
 
-        // Bubble sort ascending by fitness (lower error is better).
+        // Sort ascending: lower fitness is better.
         let mut swapped = true;
         while swapped {
             swapped = false;
             for i in 0..n.saturating_sub(1) {
-                let fa = *self.fitness.get(order[i]).unwrap_or(&f32::INFINITY);
-                let fb = *self.fitness.get(order[i + 1]).unwrap_or(&f32::INFINITY);
+                let fa = *self
+                    .episode_fitness
+                    .get(order[i])
+                    .unwrap_or(&f32::INFINITY);
+                let fb = *self
+                    .episode_fitness
+                    .get(order[i + 1])
+                    .unwrap_or(&f32::INFINITY);
                 if fa > fb {
                     order.swap(i, i + 1);
                     swapped = true;
@@ -189,80 +376,77 @@ impl LifNeuron {
             }
         }
 
-        let elite_n = (n / 2).max(1);
-        let elite = &order[..elite_n];
-        let (rest_mean, rest_std) = mean_stddev_from_elites(&self.v_rest_buffer, elite);
-        let (th_mean, th_std) = mean_stddev_from_elites(&self.v_threshold_buffer, elite);
-        self.v_rest = rest_mean;
-        self.v_rest_stddev = rest_std.max(0.01);
-        self.v_threshold = th_mean;
-        self.v_threshold_stddev = th_std.max(0.01);
+        let elite_n = ELITE_COUNT.min(n).max(1);
+        let mut weights = [0.0f32; POP_SIZE];
+        elite_rank_weights(elite_n, &mut weights);
+
+        let mut elite_rest = [0.0f32; POP_SIZE];
+        let mut elite_thr = [0.0f32; POP_SIZE];
+        for i in 0..elite_n {
+            let idx = order[i];
+            elite_rest[i] = *self.episode_v_rest.get(idx).unwrap_or(&0.0);
+            elite_thr[i] = *self.episode_v_threshold.get(idx).unwrap_or(&0.0);
+        }
+
+        self.v_rest_dist
+            .update_from_elites(&elite_rest[..elite_n], &weights[..elite_n]);
+        self.v_threshold_dist
+            .update_from_elites(&elite_thr[..elite_n], &weights[..elite_n]);
+        // Keep threshold above reset so the neuron can still spike when useful.
+        if self.v_threshold_dist.mean < self.v_reset + 0.1 {
+            self.v_threshold_dist.mean = self.v_reset + 0.1;
+        }
+
+        // Monitor: average fitness of the whole generation.
+        self.last_gen_fitness = self.episode_fitness.sum() / n as f32;
+        self.generation += 1;
+
+        // Fresh population next generation.
+        self.episode_fitness.clear();
+        self.episode_v_rest.clear();
+        self.episode_v_threshold.clear();
+        // Drop a pending antithetic that was drawn under the old distribution.
+        self.pending_antithetic = None;
+    }
+
+    fn record_step(&mut self, i_input: f32) {
+        let err = i_input - self.v_membrane;
+        self.episode_error_sum += err * err;
+        self.episode_step += 1;
+        self.input.push(i_input);
+        self.output.push(self.v_membrane);
+
+        if self.episode_step >= EPISODE_LEN as u32 {
+            self.finish_episode();
+        }
     }
 
     pub fn step(&mut self, i_input: f32, dt: f32) -> bool {
-        // Refractory: reset membrane only. Do not touch history buffers so
-        // input / output / fitness / param rings stay the same length.
+        // Refractory: hold at reset, still score tracking error so spikes that
+        // wreck the trajectory are charged to the active trial parameters.
         if self.is_refractory {
             self.is_refractory = false;
             self.v_membrane = self.v_reset;
+            self.record_step(i_input);
             return false;
         }
 
-        let (z0, _) = self.rng.g();
-        let v_rest = z0 * self.v_rest_stddev + self.v_rest;
+        let v_rest = self.trial_v_rest;
+        let v_threshold = self.trial_v_threshold;
 
-        // Euler method integration: dv = (-(v - v_rest) + I) * (dt / tau_m)
+        // Euler: dv = (-(v - v_rest) + I) * (dt / tau_m)
         let dv = (-(self.v_membrane - v_rest) + i_input) * (dt / self.tau_m);
         self.v_membrane += dv;
 
-        let (z0, _) = self.rng.g();
-        let v_threshold = z0 * self.v_threshold_stddev + self.v_threshold;
-
-        // Record one aligned trial: params used this step + tracking error.
-        self.input.push(i_input);
-        self.output.push(self.v_membrane);
-        self.v_rest_buffer.push(v_rest);
-        self.v_threshold_buffer.push(v_threshold);
-        self.fitness
-            .push(Self::tracking_error(i_input, self.v_membrane));
-
-        self.iteration += 1;
-        if self.iteration == LENGTH as u64 {
-            self.iteration = 0;
-            self.adapt_from_elites();
-        }
-
-        if self.v_membrane >= v_threshold {
+        let spiked = self.v_membrane >= v_threshold;
+        if spiked {
             self.is_refractory = true;
-            true // Spike emitted!
-        } else {
-            false
+            self.episode_spike_count += 1;
         }
-    }
-}
 
-fn mean_stddev_from_elites(
-    buffer: &RingBuffer<f32, LENGTH>,
-    elite_chrono_indices: &[usize],
-) -> (f32, f32) {
-    let n = elite_chrono_indices.len();
-    if n == 0 {
-        return (0.0, 0.01);
+        self.record_step(i_input);
+        spiked
     }
-
-    let mut avg = 0.0;
-    for &i in elite_chrono_indices {
-        avg += *buffer.get(i).unwrap_or(&0.0);
-    }
-    avg /= n as f32;
-
-    let mut var = 0.0;
-    for &i in elite_chrono_indices {
-        let diff = *buffer.get(i).unwrap_or(&0.0) - avg;
-        var += diff * diff;
-    }
-    var /= n as f32;
-    (avg, var.sqrt())
 }
 
 // Rand is a random number generator
@@ -288,7 +472,8 @@ impl Rand {
     }
 
     pub fn g(&mut self) -> (f32, f32) {
-        let u1 = self.u();
+        // Box–Muller; reject u1≈0 to avoid ln(0).
+        let u1 = self.u().max(1e-7);
         let u2 = self.u();
         let r = (-2.0 * u1.ln()).sqrt();
         let theta = 2.0 * core::f32::consts::PI * u2;
@@ -311,22 +496,19 @@ mod tests {
         rb.push(20);
         rb.push(30);
         assert_eq!(rb.len(), 3);
-        assert_eq!(rb.get(0), Some(&10)); // oldest
-        assert_eq!(rb.get(2), Some(&30)); // newest
+        assert_eq!(rb.get(0), Some(&10));
+        assert_eq!(rb.get(2), Some(&30));
         assert_eq!(rb.latest(), Some(&30));
         assert_eq!(rb.get_newest(0), Some(&30));
         assert_eq!(rb.get_newest(1), Some(&20));
         assert_eq!(rb.get_newest(2), Some(&10));
 
         rb.push(40);
-        rb.push(50); // overwrites 10
+        rb.push(50);
         assert!(rb.is_full());
         assert_eq!(rb.len(), 4);
-        assert_eq!(rb.get(0), Some(&20)); // oldest now
-        assert_eq!(rb.get(1), Some(&30));
-        assert_eq!(rb.get(2), Some(&40));
-        assert_eq!(rb.get(3), Some(&50)); // newest
-        assert_eq!(rb.latest(), Some(&50));
+        assert_eq!(rb.get(0), Some(&20));
+        assert_eq!(rb.get(3), Some(&50));
 
         assert_eq!(rb.pop(), Some(20));
         assert_eq!(rb.get(0), Some(&30));
@@ -334,72 +516,124 @@ mod tests {
     }
 
     #[test]
-    fn test_ring_buffer_copy_chronological() {
+    fn test_ring_buffer_clear() {
         let mut rb = RingBuffer::<f32, 4>::new();
-        for v in [1.0, 2.0, 3.0] {
-            rb.push(v);
-        }
-        let mut dst = [0.0; 4];
-        let n = rb.copy_chronological(&mut dst);
-        assert_eq!(n, 3);
-        assert_eq!(&dst[..3], &[1.0, 2.0, 3.0]);
+        rb.push(1.0);
+        rb.push(2.0);
+        rb.clear();
+        assert!(rb.is_empty());
+        assert_eq!(rb.len(), 0);
+        rb.push(3.0);
+        assert_eq!(rb.latest(), Some(&3.0));
     }
 
     #[test]
-    fn test_parallel_buffers_stay_aligned() {
+    fn test_elite_rank_weights_prefer_best() {
+        let mut w = [0.0; 4];
+        elite_rank_weights(4, &mut w);
+        assert!(w[0] > w[1]);
+        assert!(w[1] > w[2]);
+        assert!(w[2] > w[3]);
+        let sum: f32 = w.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_gaussian_update_moves_toward_elites() {
+        let mut p = GaussianParam::new(0.0, 0.5);
+        let elites = [2.0f32, 2.2, 1.8];
+        let mut weights = [0.0; 3];
+        elite_rank_weights(3, &mut weights);
+        p.update_from_elites(&elites, &weights);
+        assert!(p.mean > 0.5); // pulled toward ~2
+        assert!(p.stddev >= STD_MIN);
+    }
+
+    #[test]
+    fn test_refractory_still_scores_episode() {
         let mut neuron = LifNeuron::new(0.0, 1.0, 0.0, 10.0);
-        // Force a spike then a refractory step.
+        neuron.trial_v_rest = 0.0;
+        neuron.trial_v_threshold = 1.0;
         neuron.v_membrane = 10.0;
-        neuron.v_threshold = 1.0;
-        neuron.v_threshold_stddev = 0.0;
-        neuron.v_rest_stddev = 0.0;
+        neuron.pending_antithetic = None;
 
         let spiked = neuron.step(0.0, 1.0);
         assert!(spiked);
         assert_eq!(neuron.input.len(), 1);
         assert_eq!(neuron.output.len(), 1);
-        assert_eq!(neuron.fitness.len(), 1);
-        assert_eq!(neuron.v_rest_buffer.len(), 1);
-        assert_eq!(neuron.v_threshold_buffer.len(), 1);
+        assert_eq!(neuron.episode_step, 1);
 
-        // Refractory step must not desync histories.
+        // Refractory step still records I/O and advances the episode.
         let spiked = neuron.step(1.0, 1.0);
         assert!(!spiked);
-        assert_eq!(neuron.input.len(), 1);
-        assert_eq!(neuron.output.len(), 1);
-        assert_eq!(neuron.fitness.len(), 1);
+        assert_eq!(neuron.input.len(), 2);
+        assert_eq!(neuron.output.len(), 2);
+        assert_eq!(neuron.v_membrane, neuron.v_reset);
     }
 
     #[test]
-    fn test_fitness_is_abs_tracking_error() {
-        let mut neuron = LifNeuron::new(0.0, 100.0, 0.0, 10.0);
-        neuron.v_rest_stddev = 0.0;
-        neuron.v_threshold_stddev = 0.0;
-
-        neuron.step(1.0, 10.0); // dt/tau = 1 → v becomes ~1.0 from rest 0 with I=1
-        let err = *neuron.fitness.latest().unwrap();
-        let input = *neuron.input.latest().unwrap();
-        let output = *neuron.output.latest().unwrap();
-        assert!((err - (input - output).abs()).abs() < 1e-5);
-    }
-
-    #[test]
-    fn test_adapt_prefers_lower_error() {
-        // Manually fill elite selection inputs.
-        let mut neuron = LifNeuron::new(0.0, 1.0, 0.0, 10.0);
-        // Four trials: two good (rest near 0), two bad (rest far).
-        let rests = [0.0, 0.1, 5.0, 5.1];
-        let thresholds = [1.0, 1.1, 9.0, 9.1];
-        let fitness = [0.1, 0.2, 4.0, 5.0];
-        for i in 0..4 {
-            neuron.v_rest_buffer.push(rests[i]);
-            neuron.v_threshold_buffer.push(thresholds[i]);
-            neuron.fitness.push(fitness[i]);
+    fn test_cem_prefers_low_error_params() {
+        let mut neuron = LifNeuron::new(5.0, 5.0, 0.0, 10.0);
+        let rest_before = neuron.v_rest();
+        let thr_before = neuron.v_threshold();
+        // Good episodes: rest near 0, threshold moderate.
+        for _ in 0..4 {
+            neuron.episode_v_rest.push(0.0);
+            neuron.episode_v_threshold.push(2.0);
+            neuron.episode_fitness.push(0.1);
         }
-        neuron.adapt_from_elites();
-        // Elite half is the two lowest errors → rests 0.0 and 0.1
-        assert!((neuron.v_rest - 0.05).abs() < 1e-5);
-        assert!((neuron.v_threshold - 1.05).abs() < 1e-5);
+        // Bad episodes.
+        for _ in 0..4 {
+            neuron.episode_v_rest.push(8.0);
+            neuron.episode_v_threshold.push(8.0);
+            neuron.episode_fitness.push(5.0);
+        }
+        neuron.cem_update();
+        // Soft update moves partway toward elite means (~0 rest, ~2 thr).
+        assert!(
+            neuron.v_rest() < rest_before,
+            "mean rest should decrease toward 0, {} -> {}",
+            rest_before,
+            neuron.v_rest()
+        );
+        assert!(
+            neuron.v_threshold() < thr_before,
+            "mean threshold should decrease toward 2, {} -> {}",
+            thr_before,
+            neuron.v_threshold()
+        );
+        assert_eq!(neuron.generation, 1);
+        assert!(neuron.episode_fitness.is_empty());
+    }
+
+    #[test]
+    fn test_learning_reduces_tracking_error() {
+        let mut neuron = LifNeuron::new(3.0, 4.0, 0.0, 10.0);
+        let rest_before = neuron.v_rest().abs();
+        let dt = 10.0;
+        let mut injected = 1.0f32;
+        let total = 512usize;
+
+        for _ in 0..total {
+            let _ = neuron.step(injected, dt);
+            injected = if injected == 1.0 { 0.0 } else { 1.0 };
+        }
+
+        assert!(
+            neuron.generation >= 2,
+            "expected multiple CEM generations, got {}",
+            neuron.generation
+        );
+        // Steady-state V ≈ v_rest + I tracks I best when v_rest → 0.
+        assert!(
+            neuron.v_rest().abs() < rest_before,
+            "v_rest should move toward 0, before={rest_before} after={}",
+            neuron.v_rest()
+        );
+        assert!(
+            neuron.last_gen_fitness.is_finite() && neuron.last_gen_fitness >= 0.0,
+            "last_gen_fitness should be a valid cost"
+        );
     }
 
     #[test]
@@ -447,40 +681,66 @@ mod tests {
 }
 
 fn main() {
-    // 1. Initialize neuron: rest=0mV, threshold=1.0mV, reset=0mV, tau_m=10.0ms
-    let mut neuron = LifNeuron::new(0.0, 1.0, 0.0, 10.0);
+    // rest=2 (bad init so learning is visible), threshold=2.5 (above early V so
+    // non-spiking policies are reachable), reset=0, tau=10ms
+    let mut neuron = LifNeuron::new(2.0, 2.5, 0.0, 10.0);
 
-    // Simulation parameters
-    let dt = 10.0; // 1 millisecond per timestep
-    let total_steps = 128; // Simulate for 30 milliseconds
-    let mut injected_current = 1.0; // Steady current injected every step
+    let dt = 10.0;
+    let total_steps = 256;
+    let mut injected_current = 1.0;
 
     println!(
-        "Simulating 30ms with constant current injection of {} mA:",
-        injected_current
+        "CEM-LIF: pop={POP_SIZE} episode={EPISODE_LEN} elite={ELITE_COUNT} lr_mean={LR_MEAN}"
     );
-    println!("Time(ms) | Voltage(mV) | Action");
-    println!("---------------------------------");
+    println!(
+        "init: v_rest={:.3}±{:.3}  v_th={:.3}±{:.3}",
+        neuron.v_rest(),
+        neuron.v_rest_stddev(),
+        neuron.v_threshold(),
+        neuron.v_threshold_stddev()
+    );
+    println!("Time | V_m     | params (rest/th)     | Action");
+    println!("----------------------------------------------------");
 
-    // 2. Loop through time steps
-    let mut score: f32 = 0.0;
+    let mut score = 0.0f32;
     for step in 1..=total_steps {
         let spiked = neuron.step(injected_current, dt);
-
-        let visual_bar = "*".repeat((neuron.v_membrane.max(0.0) * 15.0) as usize);
+        let visual_bar = "*".repeat((neuron.v_membrane.max(0.0) * 12.0) as usize);
 
         if spiked {
-            println!("{:>-8} | {:>-11.2} | SPIKE! ⚡", step, neuron.v_membrane);
+            println!(
+                "{:>-4} | {:>-7.2} | r={:>5.2} th={:>5.2} | SPIKE",
+                step,
+                neuron.v_membrane,
+                neuron.trial_v_rest,
+                neuron.trial_v_threshold
+            );
         } else {
-            println!("{:>-8} | {:>-11.2} | {}", step, neuron.v_membrane, visual_bar);
+            println!(
+                "{:>-4} | {:>-7.2} | r={:>5.2} th={:>5.2} | {}",
+                step,
+                neuron.v_membrane,
+                neuron.trial_v_rest,
+                neuron.trial_v_threshold,
+                visual_bar
+            );
         }
-        if injected_current == 1.0 {
-            injected_current = 0.0;
-        } else {
-            injected_current = 1.0;
+
+        injected_current = if injected_current == 1.0 { 0.0 } else { 1.0 };
+        if let (Some(&i), Some(&o)) = (neuron.input.latest(), neuron.output.latest()) {
+            score += (i - o).abs();
         }
-        // Sum current fitness window once per step (not raw slots).
-        score += neuron.fitness.sum();
     }
-    println!("{{score: {:?}}}", score)
+
+    println!("----------------------------------------------------");
+    println!(
+        "final: v_rest={:.3}±{:.3}  v_th={:.3}±{:.3}  generations={}  last_gen_fit={:.4}",
+        neuron.v_rest(),
+        neuron.v_rest_stddev(),
+        neuron.v_threshold(),
+        neuron.v_threshold_stddev(),
+        neuron.generation,
+        neuron.last_gen_fitness
+    );
+    println!("{{score: {:?}}}", score);
 }

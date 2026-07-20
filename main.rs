@@ -674,7 +674,7 @@ mod tests {
             }
             stddev /= N as f32;
             stddev = stddev.sqrt();
-            assert_eq!(avg.round(), 0.0);
+            assert_eq!((10.0 * avg).round() / 10.0, 0.0);
             assert_eq!(stddev.round(), 1.0);
         }
     }

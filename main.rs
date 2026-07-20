@@ -226,7 +226,9 @@ pub struct LifNeuron {
 
     /// Search distribution over resting potential.
     pub v_rest_dist: GaussianParam,
-    /// Search distribution over spike threshold.
+    /// Search distribution over spike threshold. Also supplies the scale for
+    /// per-step stochastic (escape-noise) thresholding: each step draws
+    /// thr ~ N(trial_v_threshold, v_threshold_dist.stddev) and spikes if V ≥ thr.
     pub v_threshold_dist: GaussianParam,
 
     /// Parameters active for the current episode.
@@ -432,13 +434,18 @@ impl LifNeuron {
         }
 
         let v_rest = self.trial_v_rest;
-        let v_threshold = self.trial_v_threshold;
 
         // Euler: dv = (-(v - v_rest) + I) * (dt / tau_m)
         let dv = (-(self.v_membrane - v_rest) + i_input) * (dt / self.tau_m);
         self.v_membrane += dv;
 
-        let spiked = self.v_membrane >= v_threshold;
+        // Probabilistic firing via escape noise: sample threshold from the
+        // episode law N(trial_v_threshold, v_threshold_dist.stddev). Equivalent
+        // to spiking with P = Φ((V − μ) / σ) under that Gaussian. CEM still
+        // attributes the episode to trial_v_threshold (μ); σ is shared and
+        // shrinks as the search distribution concentrates.
+        let thr = self.sample_threshold();
+        let spiked = self.v_membrane >= thr;
         if spiked {
             self.is_refractory = true;
             self.episode_spike_count += 1;
@@ -446,6 +453,13 @@ impl LifNeuron {
 
         self.record_step(i_input);
         spiked
+    }
+
+    /// Draw one threshold sample from N(trial_v_threshold, v_threshold_dist.stddev).
+    fn sample_threshold(&mut self) -> f32 {
+        let (z, _) = self.rng.g();
+        let thr = self.trial_v_threshold + z * self.v_threshold_dist.stddev;
+        thr.max(self.v_reset + 0.05)
     }
 }
 
@@ -569,6 +583,59 @@ mod tests {
         assert_eq!(neuron.input.len(), 2);
         assert_eq!(neuron.output.len(), 2);
         assert_eq!(neuron.v_membrane, neuron.v_reset);
+    }
+
+    #[test]
+    fn test_firing_is_probabilistic_near_threshold() {
+        // With V sitting on the trial mean and non-zero σ, some steps spike and
+        // some do not (escape-noise threshold).
+        let mut neuron = LifNeuron::new(0.0, 1.0, 0.0, 1.0e9); // huge τ → V ≈ fixed
+        neuron.trial_v_rest = 1.0;
+        neuron.trial_v_threshold = 1.0;
+        neuron.v_threshold_dist = GaussianParam::new(1.0, 0.5);
+        neuron.v_membrane = 1.0;
+        neuron.pending_antithetic = None;
+        // Avoid finishing episodes / resampling mid-test.
+        neuron.episode_step = 0;
+
+        let mut spikes = 0u32;
+        let trials = 200u32;
+        for _ in 0..trials {
+            // Hold membrane at the threshold mean; leak is negligible (large τ).
+            neuron.v_membrane = 1.0;
+            neuron.is_refractory = false;
+            if neuron.step(0.0, 1e-6) {
+                spikes += 1;
+            }
+            // Don't let episode/CEM machinery reshape params.
+            neuron.episode_step = 0;
+            neuron.episode_error_sum = 0.0;
+            neuron.episode_spike_count = 0;
+        }
+        // Φ(0) = 0.5 under a symmetric Gaussian threshold; allow Monte Carlo slack.
+        assert!(
+            spikes > 30 && spikes < 170,
+            "expected mixed spikes near threshold, got {spikes}/{trials}"
+        );
+    }
+
+    #[test]
+    fn test_firing_certain_when_far_above_threshold() {
+        let mut neuron = LifNeuron::new(0.0, 1.0, 0.0, 10.0);
+        neuron.trial_v_rest = 0.0;
+        neuron.trial_v_threshold = 1.0;
+        neuron.v_threshold_dist = GaussianParam::new(1.0, 0.3);
+        neuron.pending_antithetic = None;
+
+        for _ in 0..50 {
+            neuron.v_membrane = 5.0;
+            neuron.is_refractory = false;
+            neuron.episode_step = 0;
+            assert!(
+                neuron.step(0.0, 1.0),
+                "V far above μ should almost surely spike"
+            );
+        }
     }
 
     #[test]

@@ -778,69 +778,374 @@ mod tests {
             assert_eq!(stddev.round(), 1.0);
         }
     }
+
+    #[test]
+    fn test_signal_generators_shapes() {
+        let sw = gen_square_wave(8);
+        assert_eq!(sw.len(), 8);
+        assert_eq!(sw[0][0], 1.0);
+        assert_eq!(sw[1][0], 0.0);
+
+        let oh = gen_one_hot_cycle(8, 4);
+        assert_eq!(oh[0][0], 1.0);
+        assert_eq!(oh[1][1], 1.0);
+        assert_eq!(oh[4][0], 1.0);
+        assert!((oh[0].iter().sum::<f32>() - 1.0).abs() < 1e-5);
+
+        let uc = gen_unit_circle(4, core::f32::consts::FRAC_PI_2);
+        assert!((uc[0][0] - 1.0).abs() < 1e-5);
+        assert!(uc[0][1].abs() < 1e-5);
+        assert!(uc[1][0].abs() < 1e-5);
+        assert!((uc[1][1] - 1.0).abs() < 1e-5);
+
+        let ms = gen_multi_sine(16, 0.1);
+        assert!(ms.iter().all(|v| v[0].is_finite()));
+
+        let lz = gen_lorenz(64, 0.01, 20);
+        assert_eq!(lz.len(), 64);
+        assert!(lz.iter().all(|v| v[0].is_finite() && v[1].is_finite() && v[2].is_finite()));
+        // Consecutive emitted samples should differ (non-trivial next-step).
+        let step_jump = (lz[0][0] - lz[1][0]).abs()
+            + (lz[0][1] - lz[1][1]).abs()
+            + (lz[0][2] - lz[1][2]).abs();
+        assert!(
+            step_jump > 0.01,
+            "Lorenz stride should produce a real jump, got {step_jump}"
+        );
+    }
+
+    #[test]
+    fn test_benchmark_suite_errors_are_finite() {
+        // Short horizon keeps the test fast while still exercising CEM + all tasks.
+        let results = run_benchmark_suite(64, BENCH_DT);
+        assert_eq!(results.len(), 5);
+        let names: Vec<&str> = results.iter().map(|r| r.name).collect();
+        assert_eq!(
+            names,
+            [
+                "square_wave",
+                "one_hot_cycle",
+                "unit_circle",
+                "multi_sine",
+                "lorenz"
+            ]
+        );
+        for r in &results {
+            assert!(r.mae.is_finite() && r.mae >= 0.0, "{} mae", r.name);
+            assert!(r.rmse.is_finite() && r.rmse >= 0.0, "{} rmse", r.name);
+            assert!(r.mean_l2.is_finite() && r.mean_l2 >= 0.0, "{} l2", r.name);
+            assert!(r.early_mae.is_finite(), "{} early", r.name);
+            assert!(r.late_mae.is_finite(), "{} late", r.name);
+            assert!(r.dims >= 1);
+            assert!(r.steps > 0);
+        }
+        // Same-step square-wave tracking should beat next-step one-hot (harder).
+        let sq = results.iter().find(|r| r.name == "square_wave").unwrap();
+        let oh = results.iter().find(|r| r.name == "one_hot_cycle").unwrap();
+        assert_eq!(sq.mode, ScoreMode::Track);
+        assert_eq!(oh.mode, ScoreMode::PredictNext);
+        assert_eq!(oh.dims, 4);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Benchmark signals + evaluation harness
+// ---------------------------------------------------------------------------
+
+/// Max state dimension across all benchmarks (one-hot width, Lorenz, …).
+const MAX_DIMS: usize = 4;
+/// Integration / wall-clock dt used when driving the LIF.
+const BENCH_DT: f32 = 10.0;
+/// Default horizon (prediction tasks need one extra generator step).
+const BENCH_STEPS: usize = 256;
+
+/// How the target is formed relative to the injected input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScoreMode {
+    /// Same-step tracking: inject x[t], score V against x[t].
+    Track,
+    /// Next-step prediction: inject x[t], score V against x[t+1].
+    PredictNext,
+}
+
+#[derive(Clone, Debug)]
+struct BenchResult {
+    name: &'static str,
+    mode: ScoreMode,
+    dims: usize,
+    steps: usize,
+    /// Mean absolute error over all dims × scored steps.
+    mae: f32,
+    /// Root mean squared error over all dims × scored steps.
+    rmse: f32,
+    /// Mean Euclidean residual ‖e‖₂ per time step (multi-D sensitive).
+    mean_l2: f32,
+    /// MAE on the last 25% of steps (post-learning window).
+    late_mae: f32,
+    /// MAE on the first 25% of steps (pre/early learning).
+    early_mae: f32,
+}
+
+fn fresh_neuron() -> LifNeuron {
+    // rest=2 (bad init so learning is visible), threshold=2.5 (above early V so
+    // non-spiking policies are reachable), reset=0, tau=10ms
+    LifNeuron::new(2.0, 2.5, 0.0, 10.0)
+}
+
+/// Square wave on {0, 1} — baseline 1-D tracking task.
+fn gen_square_wave(steps: usize) -> Vec<[f32; MAX_DIMS]> {
+    (0..steps)
+        .map(|t| {
+            let mut v = [0.0; MAX_DIMS];
+            v[0] = if t % 2 == 0 { 1.0 } else { 0.0 };
+            v
+        })
+        .collect()
+}
+
+/// One-hot cycle over `k` symbols: e_0 → e_1 → … → e_{k-1} → e_0.
+/// Discrete next-symbol prediction when scored with [`ScoreMode::PredictNext`].
+fn gen_one_hot_cycle(steps: usize, k: usize) -> Vec<[f32; MAX_DIMS]> {
+    assert!(k >= 2 && k <= MAX_DIMS);
+    (0..steps)
+        .map(|t| {
+            let mut v = [0.0; MAX_DIMS];
+            v[t % k] = 1.0;
+            v
+        })
+        .collect()
+}
+
+/// Unit circle: (cos θ_t, sin θ_t) with constant angular step.
+/// Smooth 2-D next-position prediction under [`ScoreMode::PredictNext`].
+fn gen_unit_circle(steps: usize, dtheta: f32) -> Vec<[f32; MAX_DIMS]> {
+    (0..steps)
+        .map(|t| {
+            let theta = t as f32 * dtheta;
+            let mut v = [0.0; MAX_DIMS];
+            v[0] = theta.cos();
+            v[1] = theta.sin();
+            v
+        })
+        .collect()
+}
+
+/// Superposition of incommensurate sines (1-D temporal structure).
+fn gen_multi_sine(steps: usize, time_dt: f32) -> Vec<[f32; MAX_DIMS]> {
+    (0..steps)
+        .map(|t| {
+            let time = t as f32 * time_dt;
+            let mut v = [0.0; MAX_DIMS];
+            // Amplitudes sum to ~1.75 peak; scale into a neuron-friendly range.
+            let raw = time.sin() + 0.5 * (2.3 * time).sin() + 0.25 * (0.7 * time).sin();
+            v[0] = raw * 0.5;
+            v
+        })
+        .collect()
+}
+
+/// Lorenz attractor (σ=10, ρ=28, β=8/3).
+///
+/// Integrates with a small stable Euler step `h`, but only **emits** a sample
+/// every `stride` micro-steps so consecutive targets are a meaningful jump on
+/// the attractor (true multi-step-ahead chaos, not a near-identity map).
+fn gen_lorenz(steps: usize, h: f32, stride: usize) -> Vec<[f32; MAX_DIMS]> {
+    const SIGMA: f32 = 10.0;
+    const RHO: f32 = 28.0;
+    const BETA: f32 = 8.0 / 3.0;
+
+    let stride = stride.max(1);
+    let mut x = 1.0f32;
+    let mut y = 1.0f32;
+    let mut z = 1.0f32;
+    // Warm up onto the attractor before scoring.
+    for _ in 0..(500 * stride) {
+        let dx = SIGMA * (y - x);
+        let dy = x * (RHO - z) - y;
+        let dz = x * y - BETA * z;
+        x += h * dx;
+        y += h * dy;
+        z += h * dz;
+    }
+
+    let mut out = Vec::with_capacity(steps);
+    for _ in 0..steps {
+        // Rough normalization into O(1) so membrane tracking is comparable.
+        let mut v = [0.0; MAX_DIMS];
+        v[0] = x / 20.0;
+        v[1] = y / 20.0;
+        v[2] = (z - 25.0) / 25.0;
+        out.push(v);
+
+        for _ in 0..stride {
+            let dx = SIGMA * (y - x);
+            let dy = x * (RHO - z) - y;
+            let dz = x * y - BETA * z;
+            x += h * dx;
+            y += h * dy;
+            z += h * dz;
+        }
+    }
+    out
+}
+
+/// Drive one LIF per dimension; report element-wise and vector errors.
+fn evaluate_series(
+    name: &'static str,
+    dims: usize,
+    series: &[[f32; MAX_DIMS]],
+    dt: f32,
+    mode: ScoreMode,
+) -> BenchResult {
+    assert!(dims >= 1 && dims <= MAX_DIMS);
+    assert!(series.len() >= 2);
+
+    let scored_steps = match mode {
+        ScoreMode::Track => series.len(),
+        ScoreMode::PredictNext => series.len() - 1,
+    };
+
+    let mut neurons: Vec<LifNeuron> = (0..dims).map(|_| fresh_neuron()).collect();
+
+    let mut sum_abs = 0.0f32;
+    let mut sum_sq = 0.0f32;
+    let mut sum_l2 = 0.0f32;
+    let mut n_elem = 0.0f32;
+
+    let early_end = (scored_steps / 4).max(1);
+    let late_start = scored_steps.saturating_sub(early_end);
+    let mut early_abs = 0.0f32;
+    let mut early_n = 0.0f32;
+    let mut late_abs = 0.0f32;
+    let mut late_n = 0.0f32;
+
+    for t in 0..scored_steps {
+        let x = &series[t];
+        let target = match mode {
+            ScoreMode::Track => x,
+            ScoreMode::PredictNext => &series[t + 1],
+        };
+
+        let mut err_sq_vec = 0.0f32;
+        for d in 0..dims {
+            let _spiked = neurons[d].step(x[d], dt);
+            let e = neurons[d].v_membrane - target[d];
+            let ae = e.abs();
+            sum_abs += ae;
+            sum_sq += e * e;
+            err_sq_vec += e * e;
+            n_elem += 1.0;
+
+            if t < early_end {
+                early_abs += ae;
+                early_n += 1.0;
+            }
+            if t >= late_start {
+                late_abs += ae;
+                late_n += 1.0;
+            }
+        }
+        sum_l2 += err_sq_vec.sqrt();
+    }
+
+    BenchResult {
+        name,
+        mode,
+        dims,
+        steps: scored_steps,
+        mae: sum_abs / n_elem.max(1.0),
+        rmse: (sum_sq / n_elem.max(1.0)).sqrt(),
+        mean_l2: sum_l2 / (scored_steps as f32).max(1.0),
+        late_mae: late_abs / late_n.max(1.0),
+        early_mae: early_abs / early_n.max(1.0),
+    }
+}
+
+fn mode_tag(mode: ScoreMode) -> &'static str {
+    match mode {
+        ScoreMode::Track => "track",
+        ScoreMode::PredictNext => "next",
+    }
+}
+
+fn print_bench_table(results: &[BenchResult]) {
+    println!(
+        "{:<16} {:>5} {:>4} {:>5} {:>8} {:>8} {:>8} {:>8} {:>8}",
+        "benchmark", "mode", "dim", "steps", "MAE", "RMSE", "mean_L2", "early", "late"
+    );
+    println!("{}", "-".repeat(78));
+    for r in results {
+        println!(
+            "{:<16} {:>5} {:>4} {:>5} {:>8.4} {:>8.4} {:>8.4} {:>8.4} {:>8.4}",
+            r.name,
+            mode_tag(r.mode),
+            r.dims,
+            r.steps,
+            r.mae,
+            r.rmse,
+            r.mean_l2,
+            r.early_mae,
+            r.late_mae
+        );
+    }
+}
+
+/// Run the full suite used by `main` and the integration test.
+///
+/// `steps` is the number of scored LIF updates per benchmark. Predict-next
+/// tasks generate one extra sample so x[t+1] exists at the last step.
+fn run_benchmark_suite(steps: usize, dt: f32) -> Vec<BenchResult> {
+    let n_next = steps + 1;
+
+    let square = gen_square_wave(steps);
+    let one_hot = gen_one_hot_cycle(n_next, 4);
+    let circle = gen_unit_circle(n_next, 0.15);
+    let multi_sine = gen_multi_sine(n_next, 0.12);
+    // Stable micro-step h=0.01; stride=20 ⇒ Δt=0.2 between samples (chaotic).
+    let lorenz = gen_lorenz(steps.max(512) + 1, 0.01, 20);
+
+    vec![
+        evaluate_series("square_wave", 1, &square, dt, ScoreMode::Track),
+        evaluate_series("one_hot_cycle", 4, &one_hot, dt, ScoreMode::PredictNext),
+        evaluate_series("unit_circle", 2, &circle, dt, ScoreMode::PredictNext),
+        evaluate_series("multi_sine", 1, &multi_sine, dt, ScoreMode::PredictNext),
+        evaluate_series("lorenz", 3, &lorenz, dt, ScoreMode::PredictNext),
+    ]
 }
 
 fn main() {
-    // rest=2 (bad init so learning is visible), threshold=2.5 (above early V so
-    // non-spiking policies are reachable), reset=0, tau=10ms
-    let mut neuron = LifNeuron::new(2.0, 2.5, 0.0, 10.0);
-
-    let dt = 10.0;
-    let total_steps = 256;
-    let mut injected_current = 1.0;
-
     println!(
-        "CEM-LIF: pop={POP_SIZE} episode={EPISODE_LEN} elite={ELITE_COUNT} lr_mean={LR_MEAN}"
+        "CEM-LIF benchmarks: pop={POP_SIZE} episode={EPISODE_LEN} elite={ELITE_COUNT} \
+         lr_mean={LR_MEAN} fire_samples={FIRE_SAMPLES}"
     );
     println!(
-        "init: v_rest={:.3}±{:.3}  v_th={:.3}±{:.3}",
-        neuron.v_rest(),
-        neuron.v_rest_stddev(),
-        neuron.v_threshold(),
-        neuron.v_threshold_stddev()
+        "score modes: square_wave = same-step track; others = next-step prediction \
+         (1 LIF per dimension)"
     );
-    println!("Time | V_m     | params (rest/th)     | Action");
-    println!("----------------------------------------------------");
+    println!();
 
-    let mut score = 0.0f32;
-    for step in 1..=total_steps {
-        let spiked = neuron.step(injected_current, dt);
-        let visual_bar = "*".repeat((neuron.v_membrane.max(0.0) * 12.0) as usize);
+    let results = run_benchmark_suite(BENCH_STEPS, BENCH_DT);
+    print_bench_table(&results);
 
-        if spiked {
-            println!(
-                "{:>-4} | {:>-7.2} | r={:>5.2} th={:>5.2} | SPIKE",
-                step,
-                neuron.v_membrane,
-                neuron.trial_v_rest,
-                neuron.trial_v_threshold
-            );
-        } else {
-            println!(
-                "{:>-4} | {:>-7.2} | r={:>5.2} th={:>5.2} | {}",
-                step,
-                neuron.v_membrane,
-                neuron.trial_v_rest,
-                neuron.trial_v_threshold,
-                visual_bar
-            );
-        }
-
-        injected_current = if injected_current == 1.0 { 0.0 } else { 1.0 };
-        if let (Some(&i), Some(&o)) = (neuron.input.latest(), neuron.output.latest()) {
-            score += (i - o).abs();
-        }
+    println!();
+    println!("error summary (MAE):");
+    for r in &results {
+        println!(
+            "  {:>14}: MAE={:.4}  RMSE={:.4}  late_MAE={:.4}  (early={:.4})",
+            r.name, r.mae, r.rmse, r.late_mae, r.early_mae
+        );
     }
 
-    println!("----------------------------------------------------");
+    // Compact machine-readable line for scripts / CI.
+    let total_mae: f32 = results.iter().map(|r| r.mae).sum();
+    println!();
     println!(
-        "final: v_rest={:.3}±{:.3}  v_th={:.3}±{:.3}  generations={}  last_gen_fit={:.4}",
-        neuron.v_rest(),
-        neuron.v_rest_stddev(),
-        neuron.v_threshold(),
-        neuron.v_threshold_stddev(),
-        neuron.generation,
-        neuron.last_gen_fitness
+        "{{scores: {{{}}}}}",
+        results
+            .iter()
+            .map(|r| format!("\"{}\": {:.6}", r.name, r.mae))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
-    println!("{{score: {:?}}}", score);
+    println!("{{total_mae: {:.6}}}", total_mae);
 }

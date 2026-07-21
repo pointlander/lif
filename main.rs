@@ -138,6 +138,8 @@ const STD_MAX: f32 = 2.0;
 const SPIKE_PENALTY: f32 = 1.5;
 /// Mild preference for small |v_rest| (steady-state V ≈ v_rest + I tracks I best at 0).
 const V_REST_L2: f32 = 0.01;
+/// Noisy membrane draws per step for majority-vote firing (odd ⇒ no ties).
+const FIRE_SAMPLES: usize = 5;
 
 /// Diagonal Gaussian over one learnable scalar.
 #[derive(Clone, Copy, Debug)]
@@ -226,9 +228,10 @@ pub struct LifNeuron {
 
     /// Search distribution over resting potential.
     pub v_rest_dist: GaussianParam,
-    /// Search distribution over spike threshold. Also supplies the scale for
-    /// per-step stochastic (escape-noise) thresholding: each step draws
-    /// thr ~ N(trial_v_threshold, v_threshold_dist.stddev) and spikes if V ≥ thr.
+    /// Search distribution over spike threshold. Also supplies the noise scale
+    /// for majority-vote firing: each step draws FIRE_SAMPLES noisy membrane
+    /// samples ~ N(V, v_threshold_dist.stddev) and spikes if a majority exceed
+    /// trial_v_threshold.
     pub v_threshold_dist: GaussianParam,
 
     /// Parameters active for the current episode.
@@ -439,13 +442,11 @@ impl LifNeuron {
         let dv = (-(self.v_membrane - v_rest) + i_input) * (dt / self.tau_m);
         self.v_membrane += dv;
 
-        // Probabilistic firing via escape noise: sample threshold from the
-        // episode law N(trial_v_threshold, v_threshold_dist.stddev). Equivalent
-        // to spiking with P = Φ((V − μ) / σ) under that Gaussian. CEM still
-        // attributes the episode to trial_v_threshold (μ); σ is shared and
-        // shrinks as the search distribution concentrates.
-        let thr = self.sample_threshold();
-        let spiked = self.v_membrane >= thr;
+        // Majority-vote firing: draw FIRE_SAMPLES noisy reads of the membrane
+        // from N(V, v_threshold_dist.stddev) and spike only if most exceed the
+        // episode threshold. CEM still attributes the episode to
+        // trial_v_threshold; σ shrinks as the search distribution concentrates.
+        let spiked = self.majority_spike();
         if spiked {
             self.is_refractory = true;
             self.episode_spike_count += 1;
@@ -455,11 +456,29 @@ impl LifNeuron {
         spiked
     }
 
-    /// Draw one threshold sample from N(trial_v_threshold, v_threshold_dist.stddev).
-    fn sample_threshold(&mut self) -> f32 {
-        let (z, _) = self.rng.g();
-        let thr = self.trial_v_threshold + z * self.v_threshold_dist.stddev;
-        thr.max(self.v_reset + 0.05)
+    /// Compare FIRE_SAMPLES noisy membrane samples to trial_v_threshold.
+    /// Returns true when a strict majority of samples are above threshold.
+    fn majority_spike(&mut self) -> bool {
+        let thr = self.trial_v_threshold;
+        let sigma = self.v_threshold_dist.stddev;
+        let v = self.v_membrane;
+        let mut above = 0usize;
+        let mut taken = 0usize;
+        while taken < FIRE_SAMPLES {
+            // Box–Muller yields a pair; use both when the remaining count allows.
+            let (z0, z1) = self.rng.g();
+            if v + z0 * sigma > thr {
+                above += 1;
+            }
+            taken += 1;
+            if taken < FIRE_SAMPLES {
+                if v + z1 * sigma > thr {
+                    above += 1;
+                }
+                taken += 1;
+            }
+        }
+        above * 2 > FIRE_SAMPLES
     }
 }
 
@@ -587,8 +606,8 @@ mod tests {
 
     #[test]
     fn test_firing_is_probabilistic_near_threshold() {
-        // With V sitting on the trial mean and non-zero σ, some steps spike and
-        // some do not (escape-noise threshold).
+        // With V on the trial threshold and non-zero σ, majority vote is still
+        // stochastic: some steps spike and some do not.
         let mut neuron = LifNeuron::new(0.0, 1.0, 0.0, 1.0e9); // huge τ → V ≈ fixed
         neuron.trial_v_rest = 1.0;
         neuron.trial_v_threshold = 1.0;
@@ -601,7 +620,7 @@ mod tests {
         let mut spikes = 0u32;
         let trials = 200u32;
         for _ in 0..trials {
-            // Hold membrane at the threshold mean; leak is negligible (large τ).
+            // Hold membrane at the threshold; leak is negligible (large τ).
             neuron.v_membrane = 1.0;
             neuron.is_refractory = false;
             if neuron.step(0.0, 1e-6) {
@@ -612,7 +631,7 @@ mod tests {
             neuron.episode_error_sum = 0.0;
             neuron.episode_spike_count = 0;
         }
-        // Φ(0) = 0.5 under a symmetric Gaussian threshold; allow Monte Carlo slack.
+        // Symmetric noise around thr ⇒ ~50% majority-above; allow Monte Carlo slack.
         assert!(
             spikes > 30 && spikes < 170,
             "expected mixed spikes near threshold, got {spikes}/{trials}"
@@ -633,9 +652,23 @@ mod tests {
             neuron.episode_step = 0;
             assert!(
                 neuron.step(0.0, 1.0),
-                "V far above μ should almost surely spike"
+                "V far above thr should almost surely spike under majority vote"
             );
         }
+    }
+
+    #[test]
+    fn test_majority_spike_counts_samples() {
+        let mut neuron = LifNeuron::new(0.0, 1.0, 0.0, 10.0);
+        neuron.trial_v_threshold = 0.0;
+        neuron.v_threshold_dist = GaussianParam::new(0.0, STD_MIN);
+        neuron.v_membrane = 1.0;
+        // Tiny σ and V well above thr ⇒ every sample is above ⇒ fire.
+        assert!(neuron.majority_spike());
+
+        neuron.v_membrane = -1.0;
+        // V well below thr ⇒ every sample is below ⇒ do not fire.
+        assert!(!neuron.majority_spike());
     }
 
     #[test]

@@ -762,6 +762,573 @@ impl Rand {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Character-level natural language model (LIF reservoir + NLMS readout)
+// ---------------------------------------------------------------------------
+
+/// Hidden LIF units for the language model (larger than the toy ensemble).
+const LM_HIDDEN: usize = 128;
+/// Sparse recurrent taps per hidden unit.
+const LM_REC_TAPS: usize = 8;
+/// Integration dt for LM reservoir steps.
+const LM_DT: f32 = 10.0;
+/// Default training path (Project Gutenberg Shakespeare, eBook #100).
+const LM_CORPUS_PATH: &str = "100.txt.utf-8";
+/// Characters used for one online training pass (streaming prefix of corpus).
+const LM_TRAIN_CHARS: usize = 400_000;
+/// Held-out window immediately after the train prefix.
+const LM_EVAL_CHARS: usize = 40_000;
+/// Online passes over the training prefix.
+const LM_EPOCHS: usize = 3;
+/// Learning rate for softmax cross-entropy readout updates.
+const LM_READOUT_LR: f32 = 0.06;
+/// Generated sample length after training.
+const LM_SAMPLE_LEN: usize = 400;
+
+/// Keep printable ASCII + newline (maps curly quotes etc. away upstream).
+fn is_lm_byte(b: u8) -> bool {
+    b == b'\n' || (32..127).contains(&b)
+}
+
+/// Byte vocabulary built from a corpus (unknown bytes map to space).
+#[derive(Clone, Debug)]
+pub struct CharVocab {
+    /// id → byte
+    pub id_to_byte: Vec<u8>,
+    /// byte → id (`u16::MAX` = missing → space id)
+    byte_to_id: [u16; 256],
+    space_id: usize,
+}
+
+impl CharVocab {
+    pub fn from_bytes(data: &[u8]) -> Self {
+        let mut present = [false; 256];
+        for &b in data {
+            if is_lm_byte(b) {
+                present[b as usize] = true;
+            }
+        }
+        present[b' ' as usize] = true;
+        present[b'\n' as usize] = true;
+
+        let mut id_to_byte = Vec::with_capacity(96);
+        let mut byte_to_id = [u16::MAX; 256];
+        for b in 0u16..256 {
+            if present[b as usize] {
+                let id = id_to_byte.len() as u16;
+                byte_to_id[b as usize] = id;
+                id_to_byte.push(b as u8);
+            }
+        }
+        let space_id = byte_to_id[b' ' as usize] as usize;
+        Self {
+            id_to_byte,
+            byte_to_id,
+            space_id,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.id_to_byte.len()
+    }
+
+    pub fn encode(&self, b: u8) -> usize {
+        let id = self.byte_to_id[b as usize];
+        if id == u16::MAX {
+            self.space_id
+        } else {
+            id as usize
+        }
+    }
+
+    pub fn decode(&self, id: usize) -> u8 {
+        self.id_to_byte[id.min(self.id_to_byte.len().saturating_sub(1))]
+    }
+}
+
+/// Normalize CRLF, map non-printable bytes to space, collapse space runs lightly.
+fn load_corpus(path: &str) -> Result<Vec<u8>, String> {
+    let raw = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        let b = raw[i];
+        let mapped = if b == b'\r' {
+            if i + 1 < raw.len() && raw[i + 1] == b'\n' {
+                i += 1;
+            }
+            b'\n'
+        } else if is_lm_byte(b) {
+            b
+        } else if b != 0 {
+            // Curly quotes / other UTF-8 → nearest ASCII-ish substitute.
+            b' '
+        } else {
+            i += 1;
+            continue;
+        };
+        // Avoid huge runs of spaces from stripped multi-byte UTF-8.
+        if mapped == b' '
+            && out.last().copied() == Some(b' ')
+        {
+            i += 1;
+            continue;
+        }
+        out.push(mapped);
+        i += 1;
+    }
+    if out.len() < 64 {
+        return Err(format!("{path} too short ({} bytes)", out.len()));
+    }
+    Ok(out)
+}
+
+#[derive(Clone, Debug)]
+pub struct LmTrainStats {
+    pub tokens: usize,
+    pub loss: f32,
+    pub accuracy: f32,
+    /// exp(mean NLL) under a softmax interpretation of the linear scores.
+    pub perplexity: f32,
+}
+
+/// Next-character LM: LIF reservoir encodes history; linear readout scores vocab.
+pub struct LifLanguageModel {
+    pub vocab: CharVocab,
+    units: Vec<LifNeuron>,
+    /// w_in[char_id][h] — column layout for one-hot input.
+    w_in: Vec<Vec<f32>>,
+    rec_idx: Vec<[usize; LM_REC_TAPS]>,
+    rec_w: Vec<[f32; LM_REC_TAPS]>,
+    /// w_out[char_id][h]
+    w_out: Vec<Vec<f32>>,
+    /// Direct bigram-ish skip: w_skip[next][prev]
+    w_skip: Vec<Vec<f32>>,
+    bias: Vec<f32>,
+    prev_v: Vec<f32>,
+    prev_id: usize,
+    hidden: usize,
+    lr: f32,
+    step_count: u32,
+    rng: Rand,
+}
+
+impl LifLanguageModel {
+    pub fn new(vocab: CharVocab, seed: u32) -> Self {
+        let v = vocab.len();
+        let h = LM_HIDDEN;
+        let mut rng = Rand::new(seed.max(1));
+        let mut units = Vec::with_capacity(h);
+        let taus = [4.0f32, 6.0, 8.0, 10.0, 14.0, 18.0, 24.0, 32.0];
+        let in_scale = 1.15 / (v as f32).sqrt();
+
+        for i in 0..h {
+            let tau = taus[i % taus.len()];
+            let mut n = LifNeuron::new(0.2 * rng.signed(), 2.2 + rng.u(), 0.0, tau);
+            n.rng = Rand::new(seed.wrapping_mul(2246822519).wrapping_add(i as u32 + 3));
+            n.resample_trial();
+            units.push(n);
+        }
+
+        // Random input columns per character.
+        let mut w_in = Vec::with_capacity(v);
+        for _ in 0..v {
+            let mut col = vec![0.0f32; h];
+            for hh in 0..h {
+                col[hh] = in_scale * rng.signed();
+            }
+            w_in.push(col);
+        }
+
+        // Sparse recurrence.
+        let mut rec_idx = Vec::with_capacity(h);
+        let mut rec_w = Vec::with_capacity(h);
+        for _ in 0..h {
+            let mut idx = [0usize; LM_REC_TAPS];
+            let mut wts = [0.0f32; LM_REC_TAPS];
+            for t in 0..LM_REC_TAPS {
+                idx[t] = (rng.u32() as usize) % h;
+                wts[t] = 0.45 * rng.signed();
+            }
+            let s: f32 = wts.iter().map(|w| w.abs()).sum::<f32>().max(1e-3);
+            let scale = REC_RADIUS / s;
+            for t in 0..LM_REC_TAPS {
+                wts[t] *= scale;
+            }
+            rec_idx.push(idx);
+            rec_w.push(wts);
+        }
+
+        let mut w_out = Vec::with_capacity(v);
+        let mut w_skip = Vec::with_capacity(v);
+        let mut bias = vec![0.0f32; v];
+        for c in 0..v {
+            w_out.push(vec![0.0f32; h]);
+            w_skip.push(vec![0.0f32; v]);
+            // Mild unigram prior: slightly prefer common-looking bytes later via data.
+            bias[c] = 0.01 * rng.signed();
+        }
+
+        Self {
+            vocab,
+            units,
+            w_in,
+            rec_idx,
+            rec_w,
+            w_out,
+            w_skip,
+            bias,
+            prev_v: vec![0.0; h],
+            prev_id: 0,
+            hidden: h,
+            lr: LM_READOUT_LR,
+            step_count: 0,
+            rng,
+        }
+    }
+
+    fn drive_hidden(&mut self, char_id: usize) {
+        let col = &self.w_in[char_id];
+        for h in 0..self.hidden {
+            let mut drive = col[h];
+            for t in 0..LM_REC_TAPS {
+                let j = self.rec_idx[h][t];
+                drive += self.rec_w[h][t] * self.prev_v[j];
+            }
+            let drive = drive.clamp(-FEATURE_CLIP, FEATURE_CLIP);
+            let _ = self.units[h].step_with_target(drive, drive, LM_DT);
+            self.prev_v[h] = self.units[h].v_membrane.clamp(-FEATURE_CLIP, FEATURE_CLIP);
+        }
+    }
+
+    /// Linear scores over the vocabulary (not normalized).
+    fn logits(&self, char_id: usize) -> Vec<f32> {
+        let v = self.vocab.len();
+        let mut scores = vec![0.0f32; v];
+        // Reservoir residual is down-weighted so it refines the bigram prior
+        // instead of drowning it early in training.
+        const RES_SCALE: f32 = 0.35;
+        for c in 0..v {
+            let mut y = self.bias[c] + self.w_skip[c][char_id];
+            let row = &self.w_out[c];
+            for h in 0..self.hidden {
+                y += RES_SCALE * row[h] * self.prev_v[h];
+            }
+            scores[c] = y;
+        }
+        scores
+    }
+
+    /// Softmax probabilities from logits (stable).
+    fn softmax(logits: &[f32]) -> Vec<f32> {
+        let mut max = f32::NEG_INFINITY;
+        for &z in logits {
+            if z > max {
+                max = z;
+            }
+        }
+        let mut out = vec![0.0f32; logits.len()];
+        let mut sum = 0.0f32;
+        for (i, &z) in logits.iter().enumerate() {
+            let e = (z - max).exp();
+            out[i] = e;
+            sum += e;
+        }
+        let inv = 1.0 / sum.max(1e-12);
+        for p in &mut out {
+            *p *= inv;
+        }
+        out
+    }
+
+    fn argmax(scores: &[f32]) -> usize {
+        let mut best_i = 0;
+        let mut best_v = f32::NEG_INFINITY;
+        for (i, &s) in scores.iter().enumerate() {
+            if s > best_v {
+                best_v = s;
+                best_i = i;
+            }
+        }
+        best_i
+    }
+
+    /// One supervised step: observe `char_id`, predict next, train toward `target_id`.
+    /// Softmax cross-entropy on linear scores; returns (top1_hit, nll).
+    pub fn learn_step(&mut self, char_id: usize, target_id: usize) -> (bool, f32) {
+        self.drive_hidden(char_id);
+        let scores = self.logits(char_id);
+        let probs = Self::softmax(&scores);
+        let hit = Self::argmax(&scores) == target_id;
+        let nll = -probs[target_id].max(1e-12).ln();
+
+        // Feature energy for step-size normalization (bias + skip + hidden).
+        let mut energy = 2.0f32;
+        for h in 0..self.hidden {
+            energy += self.prev_v[h] * self.prev_v[h];
+        }
+        self.step_count = self.step_count.saturating_add(1);
+        let lr = self.lr / (1.0 + 0.00005 * self.step_count as f32);
+        let inv = 1.0 / energy.max(1e-3);
+
+        // ∇_z CE = p − y  (y one-hot). Update readout with normalized CE gradient.
+        // Match forward residual scale so reservoir weights get the correct ∂L/∂W.
+        const RES_SCALE: f32 = 0.35;
+        const LM_WCLIP: f32 = 8.0;
+        let v = self.vocab.len();
+        for c in 0..v {
+            let grad = probs[c] - if c == target_id { 1.0 } else { 0.0 };
+            let step = lr * grad * inv;
+            self.bias[c] = (self.bias[c] - step).clamp(-LM_WCLIP, LM_WCLIP);
+            self.w_skip[c][char_id] =
+                (self.w_skip[c][char_id] - step).clamp(-LM_WCLIP, LM_WCLIP);
+            for h in 0..self.hidden {
+                let g = step * RES_SCALE * self.prev_v[h] + READOUT_L2 * self.w_out[c][h];
+                self.w_out[c][h] = (self.w_out[c][h] - g).clamp(-LM_WCLIP, LM_WCLIP);
+            }
+        }
+
+        self.prev_id = char_id;
+        (hit, nll)
+    }
+
+    /// Forward without weight updates (eval / generation).
+    pub fn observe(&mut self, char_id: usize) -> Vec<f32> {
+        self.drive_hidden(char_id);
+        let scores = self.logits(char_id);
+        self.prev_id = char_id;
+        scores
+    }
+
+    /// Seed `w_skip` from empirical bigram log-probs; bias gets unigram log-probs
+    /// only as a fallback for rare contexts (scaled down so we do not double-count).
+    pub fn warm_start_ngrams(&mut self, data: &[u8]) {
+        let v = self.vocab.len();
+        let mut uni = vec![1.0f32; v]; // Laplace
+        let mut bi = vec![vec![1.0f32; v]; v];
+        if data.len() < 2 {
+            return;
+        }
+        for i in 0..data.len().saturating_sub(1) {
+            let a = self.vocab.encode(data[i]);
+            let b = self.vocab.encode(data[i + 1]);
+            uni[b] += 1.0;
+            bi[a][b] += 1.0;
+        }
+        let uni_tot: f32 = uni.iter().sum::<f32>().max(1.0);
+        for c in 0..v {
+            // Mild unigram prior (not a second full log-prob term).
+            self.bias[c] = 0.15 * (uni[c] / uni_tot).ln();
+            let row_tot: f32 = bi[c].iter().sum::<f32>().max(1.0);
+            for n in 0..v {
+                // w_skip[next][prev] = log P(next | prev)
+                self.w_skip[n][c] = (bi[c][n] / row_tot).ln();
+            }
+        }
+    }
+
+    pub fn train_bytes(&mut self, data: &[u8], epochs: usize) -> LmTrainStats {
+        let mut hits = 0u64;
+        let mut nll_sum = 0.0f64;
+        let mut tokens = 0u64;
+        if data.len() < 2 {
+            return LmTrainStats {
+                tokens: 0,
+                loss: 0.0,
+                accuracy: 0.0,
+                perplexity: 1.0,
+            };
+        }
+        self.warm_start_ngrams(data);
+        for _ in 0..epochs.max(1) {
+            for i in 0..data.len().saturating_sub(1) {
+                let a = self.vocab.encode(data[i]);
+                let b = self.vocab.encode(data[i + 1]);
+                let (hit, nll) = self.learn_step(a, b);
+                if hit {
+                    hits += 1;
+                }
+                nll_sum += nll as f64;
+                tokens += 1;
+            }
+        }
+        let acc = if tokens == 0 {
+            0.0
+        } else {
+            hits as f32 / tokens as f32
+        };
+        let mean_nll = if tokens == 0 {
+            0.0
+        } else {
+            (nll_sum / tokens as f64) as f32
+        };
+        LmTrainStats {
+            tokens: tokens as usize,
+            loss: mean_nll,
+            accuracy: acc,
+            perplexity: mean_nll.exp(),
+        }
+    }
+
+    pub fn evaluate_bytes(&mut self, data: &[u8]) -> LmTrainStats {
+        let mut hits = 0u64;
+        let mut nll_sum = 0.0f64;
+        let mut tokens = 0u64;
+        if data.len() < 2 {
+            return LmTrainStats {
+                tokens: 0,
+                loss: 0.0,
+                accuracy: 0.0,
+                perplexity: 1.0,
+            };
+        }
+        for i in 0..data.len().saturating_sub(1) {
+            let a = self.vocab.encode(data[i]);
+            let b = self.vocab.encode(data[i + 1]);
+            let scores = self.observe(a);
+            let probs = Self::softmax(&scores);
+            if Self::argmax(&scores) == b {
+                hits += 1;
+            }
+            nll_sum += -probs[b].max(1e-12).ln() as f64;
+            tokens += 1;
+        }
+        let acc = hits as f32 / tokens.max(1) as f32;
+        let mean_nll = (nll_sum / tokens.max(1) as f64) as f32;
+        LmTrainStats {
+            tokens: tokens as usize,
+            loss: mean_nll,
+            accuracy: acc,
+            perplexity: mean_nll.exp(),
+        }
+    }
+
+    /// Sample `n` bytes continuing from `prompt` (greedy if temperature ≤ 0).
+    pub fn generate(&mut self, prompt: &[u8], n: usize, temperature: f32) -> Vec<u8> {
+        // Reset soft state but keep weights.
+        for v in &mut self.prev_v {
+            *v = 0.0;
+        }
+        for u in &mut self.units {
+            u.v_membrane = u.trial_v_rest;
+            u.is_refractory = false;
+        }
+
+        let mut out = prompt.to_vec();
+        if out.is_empty() {
+            out.push(b' ');
+        }
+        // Prime reservoir; scores after the last prompt byte predict the next char.
+        let mut scores = Vec::new();
+        for &b in &out {
+            scores = self.observe(self.vocab.encode(b));
+        }
+
+        for _ in 0..n {
+            let next = if temperature <= 1e-6 {
+                Self::argmax(&scores)
+            } else {
+                // Temperature softmax sampling.
+                let inv_t = 1.0 / temperature.max(1e-3);
+                let mut scaled = scores.clone();
+                for z in &mut scaled {
+                    *z *= inv_t;
+                }
+                let probs = Self::softmax(&scaled);
+                let mut r = self.rng.u();
+                let mut pick = probs.len() - 1;
+                for (i, &p) in probs.iter().enumerate() {
+                    if r < p {
+                        pick = i;
+                        break;
+                    }
+                    r -= p;
+                }
+                pick
+            };
+            out.push(self.vocab.decode(next));
+            scores = self.observe(next);
+        }
+        out
+    }
+}
+
+/// Train + evaluate + sample from `100.txt.utf-8` (or a provided path).
+fn run_language_model(path: &str) -> Result<(), String> {
+    println!();
+    println!("=== LIF character language model ===");
+    println!("corpus: {path}");
+
+    let corpus = load_corpus(path)?;
+    let train_end = LM_TRAIN_CHARS.min(corpus.len().saturating_sub(LM_EVAL_CHARS + 2));
+    let eval_end = (train_end + LM_EVAL_CHARS).min(corpus.len());
+    if train_end < 1024 {
+        return Err(format!(
+            "corpus too short for train/eval split ({} bytes)",
+            corpus.len()
+        ));
+    }
+    let train = &corpus[..train_end];
+    let eval = &corpus[train_end..eval_end];
+
+    let vocab = CharVocab::from_bytes(train);
+    println!(
+        "bytes: corpus={} train={} eval={} vocab={} hidden={} epochs={}",
+        corpus.len(),
+        train.len(),
+        eval.len(),
+        vocab.len(),
+        LM_HIDDEN,
+        LM_EPOCHS
+    );
+
+    let mut model = LifLanguageModel::new(vocab, 0xC0FFEE);
+    // Bigram prior alone (reservoir weights still zero).
+    model.warm_start_ngrams(train);
+    let bigram_eval = model.evaluate_bytes(eval);
+    println!(
+        "bigram prior eval: acc={:.3}  nll={:.3}  ppl={:.2}",
+        bigram_eval.accuracy, bigram_eval.loss, bigram_eval.perplexity
+    );
+
+    // Full train (re-warms ngrams, then CE over reservoir + readout).
+    let train_stats = model.train_bytes(train, LM_EPOCHS);
+    println!(
+        "train: tokens={}  acc={:.3}  nll={:.3}  ppl={:.2}",
+        train_stats.tokens, train_stats.accuracy, train_stats.loss, train_stats.perplexity
+    );
+
+    let eval_stats = model.evaluate_bytes(eval);
+    println!(
+        "eval (LIF+readout): tokens={}  acc={:.3}  nll={:.3}  ppl={:.2}",
+        eval_stats.tokens, eval_stats.accuracy, eval_stats.loss, eval_stats.perplexity
+    );
+
+    let prompt = b"To be, or not to be";
+    let sample_hot = model.generate(prompt, LM_SAMPLE_LEN, 0.7);
+    let sample_greedy = {
+        // Fresh continuation for greedy (re-prime inside generate).
+        model.generate(prompt, LM_SAMPLE_LEN / 2, 0.0)
+    };
+    println!();
+    println!("sample greedy (temp=0):");
+    println!("----");
+    println!("{}", String::from_utf8_lossy(&sample_greedy));
+    println!("----");
+    println!("sample (temp=0.7, prompt+{LM_SAMPLE_LEN} bytes):");
+    println!("----");
+    println!("{}", String::from_utf8_lossy(&sample_hot));
+    println!("----");
+    println!(
+        "{{lm: {{\"train_acc\": {:.6}, \"eval_acc\": {:.6}, \"eval_ppl\": {:.4}, \"vocab\": {}}}}}",
+        train_stats.accuracy,
+        eval_stats.accuracy,
+        eval_stats.perplexity,
+        model.vocab.len()
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1107,6 +1674,50 @@ mod tests {
             r.late_mae
         );
     }
+
+    #[test]
+    fn test_char_vocab_roundtrip() {
+        let data = b"Hello, Shakespeare!\nTo be, or not to be.";
+        let v = CharVocab::from_bytes(data);
+        assert!(v.len() >= 10);
+        for &b in data {
+            let id = v.encode(b);
+            assert_eq!(v.decode(id), b);
+        }
+        // Unknown byte maps to a valid id.
+        let unk = v.encode(0x01);
+        assert!(unk < v.len());
+    }
+
+    #[test]
+    fn test_lif_language_model_learns_tiny_corpus() {
+        // Repeating phrase should be learnable as a next-byte task.
+        let text = b"to be or not to be or not to be or not to be or not ";
+        let vocab = CharVocab::from_bytes(text);
+        let mut model = LifLanguageModel::new(vocab, 42);
+        let stats = model.train_bytes(text, 8);
+        assert!(stats.tokens > 0);
+        assert!(
+            stats.accuracy > 0.35,
+            "expected to beat unigram noise on tiny loop, acc={}",
+            stats.accuracy
+        );
+        assert!(stats.perplexity.is_finite() && stats.perplexity > 1.0);
+
+        let sample = model.generate(b"to be", 32, 0.5);
+        assert!(sample.len() > 5);
+        // Should stay within vocab bytes (valid UTF-8 for this ASCII corpus).
+        assert!(std::str::from_utf8(&sample).is_ok());
+    }
+
+    #[test]
+    fn test_load_shakespeare_corpus_prefix() {
+        let corpus = load_corpus(LM_CORPUS_PATH).expect("100.txt.utf-8 should exist");
+        assert!(corpus.len() > 100_000);
+        assert!(!corpus.contains(&b'\r'));
+        let vocab = CharVocab::from_bytes(&corpus[..50_000]);
+        assert!(vocab.len() > 40 && vocab.len() < 200);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1413,4 +2024,10 @@ fn main() {
             .join(", ")
     );
     println!("{{total_mae: {:.6}}}", total_mae);
+
+    // Character LM on Shakespeare (eBook #100).
+    if let Err(e) = run_language_model(LM_CORPUS_PATH) {
+        eprintln!("language model error: {e}");
+        std::process::exit(1);
+    }
 }

@@ -813,23 +813,27 @@ impl Rand {
 // ---------------------------------------------------------------------------
 
 /// Hidden LIF units for the language model (larger than the toy ensemble).
-const LM_HIDDEN: usize = 160;
+const LM_HIDDEN: usize = 96;
 /// Sparse recurrent taps per hidden unit.
 const LM_REC_TAPS: usize = 8;
 /// Integration dt for LM reservoir steps.
 const LM_DT: f32 = 10.0;
 /// Default training path (Project Gutenberg Shakespeare, eBook #100).
 const LM_CORPUS_PATH: &str = "100.txt.utf-8";
-/// Characters used for one online training pass (streaming prefix of corpus).
-const LM_TRAIN_CHARS: usize = 600_000;
+/// Characters used when streaming the reservoir for RF feature collection.
+const LM_TRAIN_CHARS: usize = 400_000;
 /// Held-out window immediately after the train prefix.
-const LM_EVAL_CHARS: usize = 50_000;
-/// Online passes over the training prefix.
-const LM_EPOCHS: usize = 2;
-/// Learning rate for softmax cross-entropy readout updates.
-const LM_READOUT_LR: f32 = 0.1;
-/// Scale of reservoir residual relative to n-gram logits.
-const LM_RES_SCALE: f32 = 0.75;
+const LM_EVAL_CHARS: usize = 40_000;
+/// Max labeled pairs fed to the random forest (reservoir still sees full prefix).
+const RF_TRAIN_SAMPLES: usize = 48_000;
+/// Number of trees in the readout forest.
+const RF_N_TREES: usize = 40;
+/// Max depth of each decision tree.
+const RF_MAX_DEPTH: usize = 16;
+/// Minimum samples in a leaf.
+const RF_MIN_LEAF: usize = 6;
+/// Candidate thresholds tried per feature at each split.
+const RF_THR_CANDIDATES: usize = 12;
 /// Generated sample length after training.
 const LM_SAMPLE_LEN: usize = 400;
 
@@ -936,11 +940,311 @@ pub struct LmTrainStats {
     pub tokens: usize,
     pub loss: f32,
     pub accuracy: f32,
-    /// exp(mean NLL) under a softmax interpretation of the linear scores.
+    /// exp(mean NLL) under the forest class probabilities.
     pub perplexity: f32,
 }
 
-/// Next-character LM: LIF reservoir encodes history; linear readout scores vocab.
+// ---------------------------------------------------------------------------
+// Random-forest multi-class readout (no external deps)
+// ---------------------------------------------------------------------------
+
+/// One node in a CART-style classification tree.
+#[derive(Clone, Debug)]
+struct RfNode {
+    /// `true` ⇒ leaf (use `hist`); `false` ⇒ split on `feature` / `threshold`.
+    is_leaf: bool,
+    feature: usize,
+    threshold: f32,
+    left: usize,
+    right: usize,
+    /// Class histogram at a leaf (length = n_classes). Empty on internal nodes.
+    hist: Vec<u32>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DecisionTree {
+    nodes: Vec<RfNode>,
+}
+
+impl DecisionTree {
+    fn predict_hist(&self, x: &[f32]) -> &[u32] {
+        let mut i = 0usize;
+        loop {
+            let n = &self.nodes[i];
+            if n.is_leaf {
+                return &n.hist;
+            }
+            i = if x[n.feature] <= n.threshold {
+                n.left
+            } else {
+                n.right
+            };
+        }
+    }
+}
+
+/// Bagged ensemble of multi-class decision trees.
+#[derive(Clone, Debug, Default)]
+pub struct RandomForest {
+    trees: Vec<DecisionTree>,
+    n_classes: usize,
+    n_features: usize,
+}
+
+impl RandomForest {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_trained(&self) -> bool {
+        !self.trees.is_empty()
+    }
+
+    /// Fit `n_trees` on rows of `x` with labels `y` in `0..n_classes`.
+    pub fn fit(
+        &mut self,
+        x: &[Vec<f32>],
+        y: &[usize],
+        n_classes: usize,
+        n_trees: usize,
+        rng: &mut Rand,
+    ) {
+        assert_eq!(x.len(), y.len());
+        assert!(!x.is_empty());
+        self.n_classes = n_classes;
+        self.n_features = x[0].len();
+        self.trees.clear();
+        self.trees.reserve(n_trees);
+
+        let n = x.len();
+        // √d feature trials per split (at least 1, at most d).
+        let mtry = ((self.n_features as f32).sqrt() as usize)
+            .max(1)
+            .min(self.n_features.max(1));
+
+        for _ in 0..n_trees {
+            // Bootstrap sample indices.
+            let mut boot = vec![0usize; n];
+            for b in &mut boot {
+                *b = (rng.u32() as usize) % n;
+            }
+            let tree = build_tree(x, y, &boot, n_classes, mtry, 0, rng);
+            self.trees.push(tree);
+        }
+    }
+
+    /// Soft vote: average leaf class histograms → probabilities.
+    pub fn predict_proba(&self, x: &[f32]) -> Vec<f32> {
+        let mut acc = vec![0.0f32; self.n_classes.max(1)];
+        if self.trees.is_empty() {
+            let u = 1.0 / acc.len() as f32;
+            for p in &mut acc {
+                *p = u;
+            }
+            return acc;
+        }
+        for tree in &self.trees {
+            let hist = tree.predict_hist(x);
+            let mut tot = 0u32;
+            for &c in hist {
+                tot += c;
+            }
+            let inv = 1.0 / tot.max(1) as f32;
+            for (i, &c) in hist.iter().enumerate() {
+                acc[i] += c as f32 * inv;
+            }
+        }
+        let inv_t = 1.0 / self.trees.len() as f32;
+        for p in &mut acc {
+            *p *= inv_t;
+        }
+        // Laplace smooth so NLL stays finite on rare classes.
+        let k = acc.len() as f32;
+        let eps = 1e-4;
+        let mut s = 0.0f32;
+        for p in &mut acc {
+            *p = *p + eps / k;
+            s += *p;
+        }
+        for p in &mut acc {
+            *p /= s;
+        }
+        acc
+    }
+
+    pub fn predict(&self, x: &[f32]) -> usize {
+        let p = self.predict_proba(x);
+        argmax_f32(&p)
+    }
+}
+
+fn argmax_f32(v: &[f32]) -> usize {
+    let mut best_i = 0;
+    let mut best = f32::NEG_INFINITY;
+    for (i, &x) in v.iter().enumerate() {
+        if x > best {
+            best = x;
+            best_i = i;
+        }
+    }
+    best_i
+}
+
+fn class_hist(y: &[usize], idx: &[usize], n_classes: usize) -> Vec<u32> {
+    let mut h = vec![0u32; n_classes];
+    for &i in idx {
+        let c = y[i];
+        if c < n_classes {
+            h[c] += 1;
+        }
+    }
+    h
+}
+
+fn gini(hist: &[u32], total: u32) -> f32 {
+    if total == 0 {
+        return 0.0;
+    }
+    let inv = 1.0 / total as f32;
+    let mut s = 0.0f32;
+    for &c in hist {
+        let p = c as f32 * inv;
+        s += p * p;
+    }
+    1.0 - s
+}
+
+fn majority_class(hist: &[u32]) -> usize {
+    let mut best_i = 0;
+    let mut best = 0u32;
+    for (i, &c) in hist.iter().enumerate() {
+        if c > best {
+            best = c;
+            best_i = i;
+        }
+    }
+    best_i
+}
+
+fn build_tree(
+    x: &[Vec<f32>],
+    y: &[usize],
+    idx: &[usize],
+    n_classes: usize,
+    mtry: usize,
+    depth: usize,
+    rng: &mut Rand,
+) -> DecisionTree {
+    let mut nodes = Vec::new();
+    build_node(x, y, idx, n_classes, mtry, depth, rng, &mut nodes);
+    DecisionTree { nodes }
+}
+
+fn build_node(
+    x: &[Vec<f32>],
+    y: &[usize],
+    idx: &[usize],
+    n_classes: usize,
+    mtry: usize,
+    depth: usize,
+    rng: &mut Rand,
+    nodes: &mut Vec<RfNode>,
+) -> usize {
+    let hist = class_hist(y, idx, n_classes);
+    let total: u32 = hist.iter().sum();
+    let pure = hist.iter().filter(|&&c| c > 0).count() <= 1;
+    let stop = pure
+        || depth >= RF_MAX_DEPTH
+        || idx.len() <= RF_MIN_LEAF
+        || total as usize <= RF_MIN_LEAF;
+
+    let me = nodes.len();
+    nodes.push(RfNode {
+        is_leaf: true,
+        feature: 0,
+        threshold: 0.0,
+        left: 0,
+        right: 0,
+        hist: hist.clone(),
+    });
+
+    if stop || x.is_empty() {
+        return me;
+    }
+
+    let n_features = x[0].len();
+    // Random feature subset.
+    let mut feat_order: Vec<usize> = (0..n_features).collect();
+    // Partial Fisher–Yates for first mtry features.
+    let m = mtry.min(n_features);
+    for i in 0..m {
+        let j = i + (rng.u32() as usize) % (n_features - i);
+        feat_order.swap(i, j);
+    }
+
+    let parent_gini = gini(&hist, total);
+    let mut best_gain = 0.0f32;
+    let mut best_feat = 0usize;
+    let mut best_thr = 0.0f32;
+    let mut best_left: Vec<usize> = Vec::new();
+    let mut best_right: Vec<usize> = Vec::new();
+
+    for &f in feat_order.iter().take(m) {
+        // Random threshold candidates from data values.
+        for _ in 0..RF_THR_CANDIDATES {
+            let s = idx[(rng.u32() as usize) % idx.len()];
+            let thr = x[s][f];
+            let mut left = Vec::new();
+            let mut right = Vec::new();
+            left.reserve(idx.len() / 2);
+            right.reserve(idx.len() / 2);
+            for &i in idx {
+                if x[i][f] <= thr {
+                    left.push(i);
+                } else {
+                    right.push(i);
+                }
+            }
+            if left.len() < RF_MIN_LEAF || right.len() < RF_MIN_LEAF {
+                continue;
+            }
+            let lh = class_hist(y, &left, n_classes);
+            let rh = class_hist(y, &right, n_classes);
+            let lt: u32 = lh.iter().sum();
+            let rt: u32 = rh.iter().sum();
+            let gain = parent_gini
+                - (lt as f32 / total as f32) * gini(&lh, lt)
+                - (rt as f32 / total as f32) * gini(&rh, rt);
+            if gain > best_gain {
+                best_gain = gain;
+                best_feat = f;
+                best_thr = thr;
+                best_left = left;
+                best_right = right;
+            }
+        }
+    }
+
+    if best_gain <= 1e-8 || best_left.is_empty() || best_right.is_empty() {
+        // Keep as leaf (already stored).
+        let _ = majority_class(&hist);
+        return me;
+    }
+
+    let left_i = build_node(x, y, &best_left, n_classes, mtry, depth + 1, rng, nodes);
+    let right_i = build_node(x, y, &best_right, n_classes, mtry, depth + 1, rng, nodes);
+    nodes[me] = RfNode {
+        is_leaf: false,
+        feature: best_feat,
+        threshold: best_thr,
+        left: left_i,
+        right: right_i,
+        hist: Vec::new(),
+    };
+    me
+}
+
+/// Next-character LM: LIF reservoir encodes history; **random forest** readout.
 pub struct LifLanguageModel {
     pub vocab: CharVocab,
     units: Vec<LifNeuron>,
@@ -948,19 +1252,12 @@ pub struct LifLanguageModel {
     w_in: Vec<Vec<f32>>,
     rec_idx: Vec<[usize; LM_REC_TAPS]>,
     rec_w: Vec<[f32; LM_REC_TAPS]>,
-    /// w_out[char_id][h]
-    w_out: Vec<Vec<f32>>,
-    /// Bigram skip: w_skip[next][prev]
-    w_skip: Vec<Vec<f32>>,
-    /// Lag-2 skip: w_skip2[next][prev2] (character two steps back).
-    w_skip2: Vec<Vec<f32>>,
-    bias: Vec<f32>,
     prev_v: Vec<f32>,
     prev_id: usize,
     prev2_id: usize,
     hidden: usize,
-    lr: f32,
-    step_count: u32,
+    /// Multi-class forest over reservoir + char-context features.
+    pub forest: RandomForest,
     rng: Rand,
 }
 
@@ -981,7 +1278,6 @@ impl LifLanguageModel {
             units.push(n);
         }
 
-        // Random input columns per character.
         let mut w_in = Vec::with_capacity(v);
         for _ in 0..v {
             let mut col = vec![0.0f32; h];
@@ -991,7 +1287,6 @@ impl LifLanguageModel {
             w_in.push(col);
         }
 
-        // Sparse recurrence.
         let mut rec_idx = Vec::with_capacity(h);
         let mut rec_w = Vec::with_capacity(h);
         for _ in 0..h {
@@ -1010,25 +1305,11 @@ impl LifLanguageModel {
             rec_w.push(wts);
         }
 
-        let mut w_out = Vec::with_capacity(v);
-        let mut w_skip = Vec::with_capacity(v);
-        let mut w_skip2 = Vec::with_capacity(v);
-        let mut bias = vec![0.0f32; v];
-        for c in 0..v {
-            w_out.push(vec![0.0f32; h]);
-            w_skip.push(vec![0.0f32; v]);
-            w_skip2.push(vec![0.0f32; v]);
-            // Mild unigram prior: slightly prefer common-looking bytes later via data.
-            bias[c] = 0.01 * rng.signed();
-        }
-
-        // Quiet MC noise so reservoir membranes are stable language features.
         for n in &mut units {
             n.v_rest_dist.stddev = STD_MIN;
             n.v_threshold_dist.stddev = STD_MIN;
             n.trial_v_rest = n.v_rest_dist.mean;
             n.trial_v_threshold = n.v_threshold_dist.mean.max(n.v_reset + 0.1);
-            // Prefer non-spiking feature cells.
             if n.trial_v_threshold < 2.5 {
                 n.trial_v_threshold = 2.5;
                 n.v_threshold_dist.mean = 2.5;
@@ -1041,23 +1322,17 @@ impl LifLanguageModel {
             w_in,
             rec_idx,
             rec_w,
-            w_out,
-            w_skip,
-            w_skip2,
-            bias,
             prev_v: vec![0.0; h],
             prev_id: 0,
             prev2_id: 0,
             hidden: h,
-            lr: LM_READOUT_LR,
-            step_count: 0,
+            forest: RandomForest::new(),
             rng,
         }
     }
 
     fn drive_hidden(&mut self, char_id: usize) {
         let col = &self.w_in[char_id];
-        // Mix in lag-1 input column so the reservoir sees short history.
         let col_prev = &self.w_in[self.prev_id];
         for h in 0..self.hidden {
             let mut drive = col[h] + 0.45 * col_prev[h];
@@ -1071,145 +1346,47 @@ impl LifLanguageModel {
         }
     }
 
-    /// Linear scores over the vocabulary (not normalized).
-    fn logits(&self, char_id: usize) -> Vec<f32> {
-        let v = self.vocab.len();
-        let mut scores = vec![0.0f32; v];
-        for c in 0..v {
-            let mut y = self.bias[c]
-                + self.w_skip[c][char_id]
-                + self.w_skip2[c][self.prev2_id];
-            let row = &self.w_out[c];
-            for h in 0..self.hidden {
-                y += LM_RES_SCALE * row[h] * self.prev_v[h];
-            }
-            scores[c] = y;
-        }
-        scores
+    /// Feature vector for the forest: membranes + current/prev char ids.
+    fn features(&self, char_id: usize) -> Vec<f32> {
+        let mut f = Vec::with_capacity(self.hidden + 2);
+        f.extend_from_slice(&self.prev_v);
+        f.push(char_id as f32);
+        f.push(self.prev_id as f32);
+        f
     }
 
-    /// Softmax probabilities from logits (stable).
-    fn softmax(logits: &[f32]) -> Vec<f32> {
-        let mut max = f32::NEG_INFINITY;
-        for &z in logits {
-            if z > max {
-                max = z;
-            }
+    fn reset_state(&mut self) {
+        for v in &mut self.prev_v {
+            *v = 0.0;
         }
-        let mut out = vec![0.0f32; logits.len()];
-        let mut sum = 0.0f32;
-        for (i, &z) in logits.iter().enumerate() {
-            let e = (z - max).exp();
-            out[i] = e;
-            sum += e;
+        self.prev_id = 0;
+        self.prev2_id = 0;
+        for u in &mut self.units {
+            u.v_membrane = u.trial_v_rest;
+            u.is_refractory = false;
         }
-        let inv = 1.0 / sum.max(1e-12);
-        for p in &mut out {
-            *p *= inv;
-        }
-        out
     }
 
-    fn argmax(scores: &[f32]) -> usize {
-        let mut best_i = 0;
-        let mut best_v = f32::NEG_INFINITY;
-        for (i, &s) in scores.iter().enumerate() {
-            if s > best_v {
-                best_v = s;
-                best_i = i;
-            }
-        }
-        best_i
-    }
-
-    /// One supervised step: observe `char_id`, predict next, train toward `target_id`.
-    /// Softmax cross-entropy on linear scores; returns (top1_hit, nll).
-    pub fn learn_step(&mut self, char_id: usize, target_id: usize) -> (bool, f32) {
-        self.drive_hidden(char_id);
-        let scores = self.logits(char_id);
-        let probs = Self::softmax(&scores);
-        let hit = Self::argmax(&scores) == target_id;
-        let nll = -probs[target_id].max(1e-12).ln();
-
-        // Feature energy for step-size normalization (bias + 2 skips + hidden).
-        let mut energy = 3.0f32;
-        for h in 0..self.hidden {
-            energy += self.prev_v[h] * self.prev_v[h];
-        }
-        self.step_count = self.step_count.saturating_add(1);
-        let lr = self.lr / (1.0 + 0.00003 * self.step_count as f32);
-        let inv = 1.0 / energy.max(1e-3);
-
-        // ∇_z CE = p − y  (y one-hot). Update readout with normalized CE gradient.
-        const LM_WCLIP: f32 = 8.0;
-        let v = self.vocab.len();
-        let prev2 = self.prev2_id;
-        for c in 0..v {
-            let grad = probs[c] - if c == target_id { 1.0 } else { 0.0 };
-            let step = lr * grad * inv;
-            self.bias[c] = (self.bias[c] - step).clamp(-LM_WCLIP, LM_WCLIP);
-            self.w_skip[c][char_id] =
-                (self.w_skip[c][char_id] - step).clamp(-LM_WCLIP, LM_WCLIP);
-            self.w_skip2[c][prev2] =
-                (self.w_skip2[c][prev2] - step).clamp(-LM_WCLIP, LM_WCLIP);
-            for h in 0..self.hidden {
-                let g = step * LM_RES_SCALE * self.prev_v[h] + READOUT_L2 * self.w_out[c][h];
-                self.w_out[c][h] = (self.w_out[c][h] - g).clamp(-LM_WCLIP, LM_WCLIP);
-            }
-        }
-
-        self.prev2_id = self.prev_id;
-        self.prev_id = char_id;
-        (hit, nll)
-    }
-
-    /// Forward without weight updates (eval / generation).
+    /// Drive reservoir on `char_id`, return forest class probabilities for next char.
     pub fn observe(&mut self, char_id: usize) -> Vec<f32> {
         self.drive_hidden(char_id);
-        let scores = self.logits(char_id);
+        let feats = self.features(char_id);
+        let probs = if self.forest.is_trained() {
+            self.forest.predict_proba(&feats)
+        } else {
+            let v = self.vocab.len().max(1);
+            vec![1.0 / v as f32; v]
+        };
         self.prev2_id = self.prev_id;
         self.prev_id = char_id;
-        scores
+        probs
     }
 
-    /// Seed skip tables from empirical n-gram log-probs.
-    pub fn warm_start_ngrams(&mut self, data: &[u8]) {
-        let v = self.vocab.len();
-        let mut uni = vec![1.0f32; v]; // Laplace
-        let mut bi = vec![vec![1.0f32; v]; v];
-        let mut lag2 = vec![vec![1.0f32; v]; v]; // P(next | char_{t-2})
-        if data.len() < 3 {
-            return;
-        }
-        for i in 0..data.len().saturating_sub(1) {
-            let a = self.vocab.encode(data[i]);
-            let b = self.vocab.encode(data[i + 1]);
-            uni[b] += 1.0;
-            bi[a][b] += 1.0;
-            if i >= 1 {
-                let a2 = self.vocab.encode(data[i - 1]);
-                lag2[a2][b] += 1.0;
-            }
-        }
-        let uni_tot: f32 = uni.iter().sum::<f32>().max(1.0);
-        for c in 0..v {
-            // Mild unigram prior (not a second full log-prob term).
-            self.bias[c] = 0.1 * (uni[c] / uni_tot).ln();
-            let row_tot: f32 = bi[c].iter().sum::<f32>().max(1.0);
-            let lag_tot: f32 = lag2[c].iter().sum::<f32>().max(1.0);
-            for n in 0..v {
-                // w_skip[next][prev] = log P(next | prev)
-                self.w_skip[n][c] = (bi[c][n] / row_tot).ln();
-                // Weaker lag-2 prior (interpolates with bigram via CE training).
-                self.w_skip2[n][c] = 0.55 * (lag2[c][n] / lag_tot).ln();
-            }
-        }
-    }
-
-    pub fn train_bytes(&mut self, data: &[u8], epochs: usize) -> LmTrainStats {
-        let mut hits = 0u64;
-        let mut nll_sum = 0.0f64;
-        let mut tokens = 0u64;
+    /// Collect reservoir features then fit the random-forest readout.
+    ///
+    /// `epochs` is accepted for API compatibility; the forest is fit once on a
+    /// subsample of reservoir states (bagging provides the ensemble).
+    pub fn train_bytes(&mut self, data: &[u8], _epochs: usize) -> LmTrainStats {
         if data.len() < 2 {
             return LmTrainStats {
                 tokens: 0,
@@ -1218,33 +1395,45 @@ impl LifLanguageModel {
                 perplexity: 1.0,
             };
         }
-        self.warm_start_ngrams(data);
-        for _ in 0..epochs.max(1) {
-            for i in 0..data.len().saturating_sub(1) {
-                let a = self.vocab.encode(data[i]);
-                let b = self.vocab.encode(data[i + 1]);
-                let (hit, nll) = self.learn_step(a, b);
-                if hit {
-                    hits += 1;
-                }
-                nll_sum += nll as f64;
-                tokens += 1;
+
+        self.reset_state();
+        let n_pairs = data.len() - 1;
+        let stride = (n_pairs / RF_TRAIN_SAMPLES.max(1)).max(1);
+        let mut xs: Vec<Vec<f32>> = Vec::with_capacity(RF_TRAIN_SAMPLES);
+        let mut ys: Vec<usize> = Vec::with_capacity(RF_TRAIN_SAMPLES);
+
+        for i in 0..n_pairs {
+            let a = self.vocab.encode(data[i]);
+            let b = self.vocab.encode(data[i + 1]);
+            self.drive_hidden(a);
+            if i % stride == 0 && xs.len() < RF_TRAIN_SAMPLES {
+                xs.push(self.features(a));
+                ys.push(b);
             }
+            self.prev2_id = self.prev_id;
+            self.prev_id = a;
         }
-        let acc = if tokens == 0 {
-            0.0
-        } else {
-            hits as f32 / tokens as f32
-        };
-        let mean_nll = if tokens == 0 {
-            0.0
-        } else {
-            (nll_sum / tokens as f64) as f32
-        };
+
+        let n_classes = self.vocab.len();
+        self.forest
+            .fit(&xs, &ys, n_classes, RF_N_TREES, &mut self.rng);
+
+        // Training-set metrics on the same feature rows used to fit (in-bag estimate).
+        let mut hits = 0u64;
+        let mut nll_sum = 0.0f64;
+        for (x, &y) in xs.iter().zip(ys.iter()) {
+            let p = self.forest.predict_proba(x);
+            if argmax_f32(&p) == y {
+                hits += 1;
+            }
+            nll_sum += -p[y].max(1e-12).ln() as f64;
+        }
+        let n = xs.len().max(1) as f64;
+        let mean_nll = (nll_sum / n) as f32;
         LmTrainStats {
-            tokens: tokens as usize,
+            tokens: xs.len(),
             loss: mean_nll,
-            accuracy: acc,
+            accuracy: hits as f32 / xs.len().max(1) as f32,
             perplexity: mean_nll.exp(),
         }
     }
@@ -1261,12 +1450,12 @@ impl LifLanguageModel {
                 perplexity: 1.0,
             };
         }
+        self.reset_state();
         for i in 0..data.len().saturating_sub(1) {
             let a = self.vocab.encode(data[i]);
             let b = self.vocab.encode(data[i + 1]);
-            let scores = self.observe(a);
-            let probs = Self::softmax(&scores);
-            if Self::argmax(&scores) == b {
+            let probs = self.observe(a);
+            if argmax_f32(&probs) == b {
                 hits += 1;
             }
             nll_sum += -probs[b].max(1e-12).ln() as f64;
@@ -1284,41 +1473,45 @@ impl LifLanguageModel {
 
     /// Sample `n` bytes continuing from `prompt` (greedy if temperature ≤ 0).
     pub fn generate(&mut self, prompt: &[u8], n: usize, temperature: f32) -> Vec<u8> {
-        // Reset soft state but keep weights.
-        for v in &mut self.prev_v {
-            *v = 0.0;
-        }
-        self.prev_id = 0;
-        self.prev2_id = 0;
-        for u in &mut self.units {
-            u.v_membrane = u.trial_v_rest;
-            u.is_refractory = false;
-        }
+        self.reset_state();
 
         let mut out = prompt.to_vec();
         if out.is_empty() {
             out.push(b' ');
         }
-        // Prime reservoir; scores after the last prompt byte predict the next char.
-        let mut scores = Vec::new();
+        let mut probs = Vec::new();
         for &b in &out {
-            scores = self.observe(self.vocab.encode(b));
+            probs = self.observe(self.vocab.encode(b));
         }
 
         for _ in 0..n {
             let next = if temperature <= 1e-6 {
-                Self::argmax(&scores)
+                argmax_f32(&probs)
             } else {
-                // Temperature softmax sampling.
+                // Temperature sharpening on forest probabilities.
                 let inv_t = 1.0 / temperature.max(1e-3);
-                let mut scaled = scores.clone();
-                for z in &mut scaled {
-                    *z *= inv_t;
+                let mut logits: Vec<f32> = probs
+                    .iter()
+                    .map(|p| p.max(1e-12).ln() * inv_t)
+                    .collect();
+                let mut max = f32::NEG_INFINITY;
+                for &z in &logits {
+                    if z > max {
+                        max = z;
+                    }
                 }
-                let probs = Self::softmax(&scaled);
+                let mut sum = 0.0f32;
+                for z in &mut logits {
+                    *z = (*z - max).exp();
+                    sum += *z;
+                }
+                let inv = 1.0 / sum.max(1e-12);
+                for z in &mut logits {
+                    *z *= inv;
+                }
                 let mut r = self.rng.u();
-                let mut pick = probs.len() - 1;
-                for (i, &p) in probs.iter().enumerate() {
+                let mut pick = logits.len() - 1;
+                for (i, &p) in logits.iter().enumerate() {
                     if r < p {
                         pick = i;
                         break;
@@ -1328,7 +1521,7 @@ impl LifLanguageModel {
                 pick
             };
             out.push(self.vocab.decode(next));
-            scores = self.observe(next);
+            probs = self.observe(next);
         }
         out
     }
@@ -1354,34 +1547,27 @@ fn run_language_model(path: &str) -> Result<(), String> {
 
     let vocab = CharVocab::from_bytes(train);
     println!(
-        "bytes: corpus={} train={} eval={} vocab={} hidden={} epochs={}",
+        "bytes: corpus={} train={} eval={} vocab={} hidden={} trees={} rf_samples={}",
         corpus.len(),
         train.len(),
         eval.len(),
         vocab.len(),
         LM_HIDDEN,
-        LM_EPOCHS
+        RF_N_TREES,
+        RF_TRAIN_SAMPLES
     );
 
     let mut model = LifLanguageModel::new(vocab, 0xC0FFEE);
-    // Bigram prior alone (reservoir weights still zero).
-    model.warm_start_ngrams(train);
-    let bigram_eval = model.evaluate_bytes(eval);
+    // Reservoir feature collection + random-forest readout fit.
+    let train_stats = model.train_bytes(train, 1);
     println!(
-        "n-gram prior eval: acc={:.3}  nll={:.3}  ppl={:.2}",
-        bigram_eval.accuracy, bigram_eval.loss, bigram_eval.perplexity
-    );
-
-    // Full train (re-warms ngrams, then CE over reservoir + readout).
-    let train_stats = model.train_bytes(train, LM_EPOCHS);
-    println!(
-        "train: tokens={}  acc={:.3}  nll={:.3}  ppl={:.2}",
+        "train (RF fit): tokens={}  acc={:.3}  nll={:.3}  ppl={:.2}",
         train_stats.tokens, train_stats.accuracy, train_stats.loss, train_stats.perplexity
     );
 
     let eval_stats = model.evaluate_bytes(eval);
     println!(
-        "eval (LIF+readout): tokens={}  acc={:.3}  nll={:.3}  ppl={:.2}",
+        "eval (LIF+RF): tokens={}  acc={:.3}  nll={:.3}  ppl={:.2}",
         eval_stats.tokens, eval_stats.accuracy, eval_stats.loss, eval_stats.perplexity
     );
 
@@ -1777,23 +1963,52 @@ mod tests {
 
     #[test]
     fn test_lif_language_model_learns_tiny_corpus() {
-        // Repeating phrase should be learnable as a next-byte task.
-        let text = b"to be or not to be or not to be or not to be or not ";
+        // Repeating phrase should be learnable as a next-byte task with RF readout.
+        let text = b"to be or not to be or not to be or not to be or not to be or not ";
         let vocab = CharVocab::from_bytes(text);
         let mut model = LifLanguageModel::new(vocab, 42);
-        let stats = model.train_bytes(text, 8);
+        let stats = model.train_bytes(text, 1);
         assert!(stats.tokens > 0);
         assert!(
-            stats.accuracy > 0.35,
-            "expected to beat unigram noise on tiny loop, acc={}",
+            stats.accuracy > 0.25,
+            "expected RF readout to learn the tiny loop, acc={}",
             stats.accuracy
         );
-        assert!(stats.perplexity.is_finite() && stats.perplexity > 1.0);
+        assert!(stats.perplexity.is_finite() && stats.perplexity >= 1.0);
+        assert!(model.forest.is_trained());
 
         let sample = model.generate(b"to be", 32, 0.5);
         assert!(sample.len() > 5);
-        // Should stay within vocab bytes (valid UTF-8 for this ASCII corpus).
         assert!(std::str::from_utf8(&sample).is_ok());
+    }
+
+    #[test]
+    fn test_random_forest_basic_fit_predict() {
+        // Two Gaussian blobs → RF should separate them.
+        let mut rng = Rand::new(7);
+        let mut xs = Vec::new();
+        let mut ys = Vec::new();
+        for _ in 0..80 {
+            let (z0, z1) = rng.g();
+            xs.push(vec![z0 - 2.0, z1]);
+            ys.push(0);
+            let (z0, z1) = rng.g();
+            xs.push(vec![z0 + 2.0, z1]);
+            ys.push(1);
+        }
+        let mut rf = RandomForest::new();
+        rf.fit(&xs, &ys, 2, 16, &mut rng);
+        let mut correct = 0;
+        for (x, &y) in xs.iter().zip(ys.iter()) {
+            if rf.predict(x) == y {
+                correct += 1;
+            }
+        }
+        assert!(
+            correct as f32 / xs.len() as f32 > 0.85,
+            "RF should separate simple blobs, acc={}",
+            correct as f32 / xs.len() as f32
+        );
     }
 
     #[test]

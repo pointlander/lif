@@ -135,26 +135,30 @@ const LR_STD: f32 = 0.40;
 const STD_MIN: f32 = 0.05;
 const STD_MAX: f32 = 2.0;
 /// Extra cost when a spike resets the membrane during tracking.
-const SPIKE_PENALTY: f32 = 0.35;
+const SPIKE_PENALTY: f32 = 0.2;
 /// Mild preference for small |v_rest| (steady-state V ≈ v_rest + I tracks I best at 0).
 const V_REST_L2: f32 = 0.01;
 /// Monte Carlo draws of (v_rest, v_threshold) per step (odd ⇒ no ties).
-const MC_SAMPLES: usize = 5;
+const MC_SAMPLES: usize = 9;
+/// Fraction of search-dist stddev used as MC noise (keeps features stable).
+const MC_NOISE_SCALE: f32 = 0.3;
+/// Initial CEM exploration scale (smaller ⇒ cleaner early tracking).
+const INIT_STD: f32 = 0.25;
 
 /// Hidden LIF units in the reservoir ensemble.
-const ENSEMBLE_N: usize = 32;
+const ENSEMBLE_N: usize = 48;
 /// Normalized-LMS step size for the linear readout (decays mildly over a run).
-const READOUT_LR: f32 = 0.4;
+const READOUT_LR: f32 = 0.45;
 /// L2 weight decay on readout weights.
-const READOUT_L2: f32 = 1e-4;
+const READOUT_L2: f32 = 5e-5;
 /// Spectral radius target for sparse recurrent weights.
-const REC_RADIUS: f32 = 0.4;
+const REC_RADIUS: f32 = 0.5;
 /// Clamp membrane features / drives so a spike storm cannot blow up SGD.
 const FEATURE_CLIP: f32 = 4.0;
 /// Clamp absolute readout weights.
-const WEIGHT_CLIP: f32 = 4.0;
+const WEIGHT_CLIP: f32 = 5.0;
 /// Online passes over each series (last pass is scored).
-const TRAIN_PASSES: usize = 3;
+const TRAIN_PASSES: usize = 5;
 /// Max state dimension across benchmarks / ensemble I/O (one-hot, Lorenz, …).
 const MAX_DIMS: usize = 4;
 
@@ -281,8 +285,8 @@ impl LifNeuron {
             v_reset,
             tau_m,
             is_refractory: false,
-            v_rest_dist: GaussianParam::new(v_rest, 0.8),
-            v_threshold_dist: GaussianParam::new(v_threshold, 0.8),
+            v_rest_dist: GaussianParam::new(v_rest, INIT_STD),
+            v_threshold_dist: GaussianParam::new(v_threshold, INIT_STD),
             trial_v_rest: v_rest,
             trial_v_threshold: v_threshold,
             pending_antithetic: None,
@@ -484,18 +488,25 @@ impl LifNeuron {
     }
 
     /// Run `MC_SAMPLES` LIF micro-steps with params drawn from
-    /// `v_rest_dist` / `v_threshold_dist` (trial mean, learned stddev).
+    /// `v_rest_dist` / `v_threshold_dist` (trial mean, scaled learned stddev).
     /// Returns `(mean_post_voltage, majority_fired)`.
     fn monte_carlo_step(&mut self, drive: f32, dt: f32) -> (f32, bool) {
         let v0 = self.v_membrane;
         let decay = (-dt / self.tau_m.max(1e-3)).exp();
         let thr_floor = self.v_reset + 0.05;
 
-        // Episode law: CEM particle as mean, search-dist stddev as MC noise.
-        let rest_law =
-            GaussianParam::new(self.trial_v_rest, self.v_rest_dist.stddev);
-        let thr_law =
-            GaussianParam::new(self.trial_v_threshold, self.v_threshold_dist.stddev);
+        // Episode law: CEM particle as mean; MC noise is a fraction of search std
+        // so membrane features stay smooth while firing stays probabilistic.
+        let rest_std = (self.v_rest_dist.stddev * MC_NOISE_SCALE).max(STD_MIN * 0.5);
+        let thr_std = (self.v_threshold_dist.stddev * MC_NOISE_SCALE).max(STD_MIN * 0.5);
+        let rest_law = GaussianParam {
+            mean: self.trial_v_rest,
+            stddev: rest_std,
+        };
+        let thr_law = GaussianParam {
+            mean: self.trial_v_threshold,
+            stddev: thr_std,
+        };
 
         let mut fire_votes = 0usize;
         let mut v_sum = 0.0f32;
@@ -543,9 +554,12 @@ pub struct LifEnsemble {
     w_skip: Vec<[f32; MAX_DIMS]>,
     /// One-step delay skip: contribution of x_i[t-1] (temporal context).
     w_delay: Vec<[f32; MAX_DIMS]>,
+    /// Two-step delay skip: x_i[t-2] (helps multi-sine / slow dynamics).
+    w_delay2: Vec<[f32; MAX_DIMS]>,
     bias: [f32; MAX_DIMS],
     prev_v: [f32; ENSEMBLE_N],
     prev_x: [f32; MAX_DIMS],
+    prev2_x: [f32; MAX_DIMS],
     in_dims: usize,
     out_dims: usize,
     lr: f32,
@@ -621,6 +635,7 @@ impl LifEnsemble {
         let mut w_out = Vec::with_capacity(out_dims);
         let mut w_skip = Vec::with_capacity(out_dims);
         let mut w_delay = Vec::with_capacity(out_dims);
+        let mut w_delay2 = Vec::with_capacity(out_dims);
         for d in 0..out_dims {
             let mut row = [0.0f32; ENSEMBLE_N];
             // Warm-start identity hidden taps toward corresponding outputs.
@@ -632,10 +647,20 @@ impl LifEnsemble {
             let mut skip = [0.0f32; MAX_DIMS];
             // Warm-start skip as identity (good for track; next-step adapts).
             if d < in_dims {
-                skip[d] = 0.5;
+                skip[d] = 0.55;
             }
             w_skip.push(skip);
             w_delay.push([0.0; MAX_DIMS]);
+            w_delay2.push([0.0; MAX_DIMS]);
+        }
+
+        // Quiet MC noise in the reservoir so readout features are stable; CEM
+        // still adapts means via trial particles.
+        for n in &mut units {
+            n.v_rest_dist.stddev = STD_MIN;
+            n.v_threshold_dist.stddev = STD_MIN;
+            n.trial_v_rest = n.v_rest_dist.mean;
+            n.trial_v_threshold = n.v_threshold_dist.mean.max(n.v_reset + 0.1);
         }
 
         Self {
@@ -645,9 +670,11 @@ impl LifEnsemble {
             w_out,
             w_skip,
             w_delay,
+            w_delay2,
             bias: [0.0; MAX_DIMS],
             prev_v: [0.0; ENSEMBLE_N],
             prev_x: [0.0; MAX_DIMS],
+            prev2_x: [0.0; MAX_DIMS],
             in_dims,
             out_dims,
             lr: READOUT_LR,
@@ -688,10 +715,12 @@ impl LifEnsemble {
             energy += self.prev_v[h] * self.prev_v[h];
         }
         for d in 0..self.in_dims {
-            energy += x[d] * x[d] + self.prev_x[d] * self.prev_x[d];
+            energy += x[d] * x[d]
+                + self.prev_x[d] * self.prev_x[d]
+                + self.prev2_x[d] * self.prev2_x[d];
         }
 
-        // --- linear readout: y = b + W_h V + W_x x + W_Δ x_prev ---
+        // --- linear readout: y = b + W_h V + W_x x + W_1 x_{t-1} + W_2 x_{t-2} ---
         let mut pred = [0.0f32; MAX_DIMS];
         for d in 0..self.out_dims {
             let mut y = self.bias[d];
@@ -701,12 +730,13 @@ impl LifEnsemble {
             for i in 0..self.in_dims {
                 y += self.w_skip[d][i] * x[i];
                 y += self.w_delay[d][i] * self.prev_x[i];
+                y += self.w_delay2[d][i] * self.prev2_x[i];
             }
             pred[d] = y.clamp(-FEATURE_CLIP * 2.0, FEATURE_CLIP * 2.0);
         }
 
         self.step_count = self.step_count.saturating_add(1);
-        let lr = self.lr / (1.0 + 0.001 * self.step_count as f32);
+        let lr = self.lr / (1.0 + 0.0008 * self.step_count as f32);
         let inv_norm = 1.0 / energy.max(1e-3);
 
         for d in 0..self.out_dims {
@@ -724,10 +754,14 @@ impl LifEnsemble {
                 let g_d = step * self.prev_x[i] + READOUT_L2 * self.w_delay[d][i];
                 self.w_delay[d][i] =
                     (self.w_delay[d][i] - g_d).clamp(-WEIGHT_CLIP, WEIGHT_CLIP);
+                let g_d2 = step * self.prev2_x[i] + READOUT_L2 * self.w_delay2[d][i];
+                self.w_delay2[d][i] =
+                    (self.w_delay2[d][i] - g_d2).clamp(-WEIGHT_CLIP, WEIGHT_CLIP);
             }
         }
 
         for d in 0..self.in_dims {
+            self.prev2_x[d] = self.prev_x[d];
             self.prev_x[d] = x[d];
         }
 
@@ -779,7 +813,7 @@ impl Rand {
 // ---------------------------------------------------------------------------
 
 /// Hidden LIF units for the language model (larger than the toy ensemble).
-const LM_HIDDEN: usize = 128;
+const LM_HIDDEN: usize = 160;
 /// Sparse recurrent taps per hidden unit.
 const LM_REC_TAPS: usize = 8;
 /// Integration dt for LM reservoir steps.
@@ -787,13 +821,15 @@ const LM_DT: f32 = 10.0;
 /// Default training path (Project Gutenberg Shakespeare, eBook #100).
 const LM_CORPUS_PATH: &str = "100.txt.utf-8";
 /// Characters used for one online training pass (streaming prefix of corpus).
-const LM_TRAIN_CHARS: usize = 400_000;
+const LM_TRAIN_CHARS: usize = 600_000;
 /// Held-out window immediately after the train prefix.
-const LM_EVAL_CHARS: usize = 40_000;
+const LM_EVAL_CHARS: usize = 50_000;
 /// Online passes over the training prefix.
-const LM_EPOCHS: usize = 3;
+const LM_EPOCHS: usize = 2;
 /// Learning rate for softmax cross-entropy readout updates.
-const LM_READOUT_LR: f32 = 0.06;
+const LM_READOUT_LR: f32 = 0.1;
+/// Scale of reservoir residual relative to n-gram logits.
+const LM_RES_SCALE: f32 = 0.75;
 /// Generated sample length after training.
 const LM_SAMPLE_LEN: usize = 400;
 
@@ -914,11 +950,14 @@ pub struct LifLanguageModel {
     rec_w: Vec<[f32; LM_REC_TAPS]>,
     /// w_out[char_id][h]
     w_out: Vec<Vec<f32>>,
-    /// Direct bigram-ish skip: w_skip[next][prev]
+    /// Bigram skip: w_skip[next][prev]
     w_skip: Vec<Vec<f32>>,
+    /// Lag-2 skip: w_skip2[next][prev2] (character two steps back).
+    w_skip2: Vec<Vec<f32>>,
     bias: Vec<f32>,
     prev_v: Vec<f32>,
     prev_id: usize,
+    prev2_id: usize,
     hidden: usize,
     lr: f32,
     step_count: u32,
@@ -973,12 +1012,27 @@ impl LifLanguageModel {
 
         let mut w_out = Vec::with_capacity(v);
         let mut w_skip = Vec::with_capacity(v);
+        let mut w_skip2 = Vec::with_capacity(v);
         let mut bias = vec![0.0f32; v];
         for c in 0..v {
             w_out.push(vec![0.0f32; h]);
             w_skip.push(vec![0.0f32; v]);
+            w_skip2.push(vec![0.0f32; v]);
             // Mild unigram prior: slightly prefer common-looking bytes later via data.
             bias[c] = 0.01 * rng.signed();
+        }
+
+        // Quiet MC noise so reservoir membranes are stable language features.
+        for n in &mut units {
+            n.v_rest_dist.stddev = STD_MIN;
+            n.v_threshold_dist.stddev = STD_MIN;
+            n.trial_v_rest = n.v_rest_dist.mean;
+            n.trial_v_threshold = n.v_threshold_dist.mean.max(n.v_reset + 0.1);
+            // Prefer non-spiking feature cells.
+            if n.trial_v_threshold < 2.5 {
+                n.trial_v_threshold = 2.5;
+                n.v_threshold_dist.mean = 2.5;
+            }
         }
 
         Self {
@@ -989,9 +1043,11 @@ impl LifLanguageModel {
             rec_w,
             w_out,
             w_skip,
+            w_skip2,
             bias,
             prev_v: vec![0.0; h],
             prev_id: 0,
+            prev2_id: 0,
             hidden: h,
             lr: LM_READOUT_LR,
             step_count: 0,
@@ -1001,8 +1057,10 @@ impl LifLanguageModel {
 
     fn drive_hidden(&mut self, char_id: usize) {
         let col = &self.w_in[char_id];
+        // Mix in lag-1 input column so the reservoir sees short history.
+        let col_prev = &self.w_in[self.prev_id];
         for h in 0..self.hidden {
-            let mut drive = col[h];
+            let mut drive = col[h] + 0.45 * col_prev[h];
             for t in 0..LM_REC_TAPS {
                 let j = self.rec_idx[h][t];
                 drive += self.rec_w[h][t] * self.prev_v[j];
@@ -1017,14 +1075,13 @@ impl LifLanguageModel {
     fn logits(&self, char_id: usize) -> Vec<f32> {
         let v = self.vocab.len();
         let mut scores = vec![0.0f32; v];
-        // Reservoir residual is down-weighted so it refines the bigram prior
-        // instead of drowning it early in training.
-        const RES_SCALE: f32 = 0.35;
         for c in 0..v {
-            let mut y = self.bias[c] + self.w_skip[c][char_id];
+            let mut y = self.bias[c]
+                + self.w_skip[c][char_id]
+                + self.w_skip2[c][self.prev2_id];
             let row = &self.w_out[c];
             for h in 0..self.hidden {
-                y += RES_SCALE * row[h] * self.prev_v[h];
+                y += LM_RES_SCALE * row[h] * self.prev_v[h];
             }
             scores[c] = y;
         }
@@ -1074,32 +1131,34 @@ impl LifLanguageModel {
         let hit = Self::argmax(&scores) == target_id;
         let nll = -probs[target_id].max(1e-12).ln();
 
-        // Feature energy for step-size normalization (bias + skip + hidden).
-        let mut energy = 2.0f32;
+        // Feature energy for step-size normalization (bias + 2 skips + hidden).
+        let mut energy = 3.0f32;
         for h in 0..self.hidden {
             energy += self.prev_v[h] * self.prev_v[h];
         }
         self.step_count = self.step_count.saturating_add(1);
-        let lr = self.lr / (1.0 + 0.00005 * self.step_count as f32);
+        let lr = self.lr / (1.0 + 0.00003 * self.step_count as f32);
         let inv = 1.0 / energy.max(1e-3);
 
         // ∇_z CE = p − y  (y one-hot). Update readout with normalized CE gradient.
-        // Match forward residual scale so reservoir weights get the correct ∂L/∂W.
-        const RES_SCALE: f32 = 0.35;
         const LM_WCLIP: f32 = 8.0;
         let v = self.vocab.len();
+        let prev2 = self.prev2_id;
         for c in 0..v {
             let grad = probs[c] - if c == target_id { 1.0 } else { 0.0 };
             let step = lr * grad * inv;
             self.bias[c] = (self.bias[c] - step).clamp(-LM_WCLIP, LM_WCLIP);
             self.w_skip[c][char_id] =
                 (self.w_skip[c][char_id] - step).clamp(-LM_WCLIP, LM_WCLIP);
+            self.w_skip2[c][prev2] =
+                (self.w_skip2[c][prev2] - step).clamp(-LM_WCLIP, LM_WCLIP);
             for h in 0..self.hidden {
-                let g = step * RES_SCALE * self.prev_v[h] + READOUT_L2 * self.w_out[c][h];
+                let g = step * LM_RES_SCALE * self.prev_v[h] + READOUT_L2 * self.w_out[c][h];
                 self.w_out[c][h] = (self.w_out[c][h] - g).clamp(-LM_WCLIP, LM_WCLIP);
             }
         }
 
+        self.prev2_id = self.prev_id;
         self.prev_id = char_id;
         (hit, nll)
     }
@@ -1108,17 +1167,18 @@ impl LifLanguageModel {
     pub fn observe(&mut self, char_id: usize) -> Vec<f32> {
         self.drive_hidden(char_id);
         let scores = self.logits(char_id);
+        self.prev2_id = self.prev_id;
         self.prev_id = char_id;
         scores
     }
 
-    /// Seed `w_skip` from empirical bigram log-probs; bias gets unigram log-probs
-    /// only as a fallback for rare contexts (scaled down so we do not double-count).
+    /// Seed skip tables from empirical n-gram log-probs.
     pub fn warm_start_ngrams(&mut self, data: &[u8]) {
         let v = self.vocab.len();
         let mut uni = vec![1.0f32; v]; // Laplace
         let mut bi = vec![vec![1.0f32; v]; v];
-        if data.len() < 2 {
+        let mut lag2 = vec![vec![1.0f32; v]; v]; // P(next | char_{t-2})
+        if data.len() < 3 {
             return;
         }
         for i in 0..data.len().saturating_sub(1) {
@@ -1126,15 +1186,22 @@ impl LifLanguageModel {
             let b = self.vocab.encode(data[i + 1]);
             uni[b] += 1.0;
             bi[a][b] += 1.0;
+            if i >= 1 {
+                let a2 = self.vocab.encode(data[i - 1]);
+                lag2[a2][b] += 1.0;
+            }
         }
         let uni_tot: f32 = uni.iter().sum::<f32>().max(1.0);
         for c in 0..v {
             // Mild unigram prior (not a second full log-prob term).
-            self.bias[c] = 0.15 * (uni[c] / uni_tot).ln();
+            self.bias[c] = 0.1 * (uni[c] / uni_tot).ln();
             let row_tot: f32 = bi[c].iter().sum::<f32>().max(1.0);
+            let lag_tot: f32 = lag2[c].iter().sum::<f32>().max(1.0);
             for n in 0..v {
                 // w_skip[next][prev] = log P(next | prev)
                 self.w_skip[n][c] = (bi[c][n] / row_tot).ln();
+                // Weaker lag-2 prior (interpolates with bigram via CE training).
+                self.w_skip2[n][c] = 0.55 * (lag2[c][n] / lag_tot).ln();
             }
         }
     }
@@ -1221,6 +1288,8 @@ impl LifLanguageModel {
         for v in &mut self.prev_v {
             *v = 0.0;
         }
+        self.prev_id = 0;
+        self.prev2_id = 0;
         for u in &mut self.units {
             u.v_membrane = u.trial_v_rest;
             u.is_refractory = false;
@@ -1299,7 +1368,7 @@ fn run_language_model(path: &str) -> Result<(), String> {
     model.warm_start_ngrams(train);
     let bigram_eval = model.evaluate_bytes(eval);
     println!(
-        "bigram prior eval: acc={:.3}  nll={:.3}  ppl={:.2}",
+        "n-gram prior eval: acc={:.3}  nll={:.3}  ppl={:.2}",
         bigram_eval.accuracy, bigram_eval.loss, bigram_eval.perplexity
     );
 

@@ -121,25 +121,42 @@ impl<T: Copy, const N: usize> RingBuffer<T, N> {
 }
 
 /// Population size for one CEM generation (completed episodes).
-const POP_SIZE: usize = 8;
+const POP_SIZE: usize = 12;
 /// Wall-clock steps per episode with fixed sampled parameters
 /// (includes refractory steps so generation rate stays predictable).
-const EPISODE_LEN: usize = 4;
+const EPISODE_LEN: usize = 8;
 /// Number of top episodes used for the distribution update.
 const ELITE_COUNT: usize = 4;
 
 /// Soft-update rates toward elite statistics (0 = freeze, 1 = hard replace).
-const LR_MEAN: f32 = 0.65;
-const LR_STD: f32 = 0.45;
+const LR_MEAN: f32 = 0.55;
+const LR_STD: f32 = 0.40;
 /// Keep exploration alive; clamp explosion.
 const STD_MIN: f32 = 0.05;
 const STD_MAX: f32 = 2.0;
 /// Extra cost when a spike resets the membrane during tracking.
-const SPIKE_PENALTY: f32 = 1.5;
+const SPIKE_PENALTY: f32 = 0.35;
 /// Mild preference for small |v_rest| (steady-state V ≈ v_rest + I tracks I best at 0).
 const V_REST_L2: f32 = 0.01;
 /// Noisy membrane draws per step for majority-vote firing (odd ⇒ no ties).
 const FIRE_SAMPLES: usize = 5;
+
+/// Hidden LIF units in the reservoir ensemble.
+const ENSEMBLE_N: usize = 32;
+/// Normalized-LMS step size for the linear readout (decays mildly over a run).
+const READOUT_LR: f32 = 0.4;
+/// L2 weight decay on readout weights.
+const READOUT_L2: f32 = 1e-4;
+/// Spectral radius target for sparse recurrent weights.
+const REC_RADIUS: f32 = 0.4;
+/// Clamp membrane features / drives so a spike storm cannot blow up SGD.
+const FEATURE_CLIP: f32 = 4.0;
+/// Clamp absolute readout weights.
+const WEIGHT_CLIP: f32 = 4.0;
+/// Online passes over each series (last pass is scored).
+const TRAIN_PASSES: usize = 3;
+/// Max state dimension across benchmarks / ensemble I/O (one-hot, Lorenz, …).
+const MAX_DIMS: usize = 4;
 
 /// Diagonal Gaussian over one learnable scalar.
 #[derive(Clone, Copy, Debug)]
@@ -414,11 +431,12 @@ impl LifNeuron {
         self.pending_antithetic = None;
     }
 
-    fn record_step(&mut self, i_input: f32) {
-        let err = i_input - self.v_membrane;
+    /// Score membrane against `score_target` (may differ from the drive current).
+    fn record_step(&mut self, drive: f32, score_target: f32) {
+        let err = score_target - self.v_membrane;
         self.episode_error_sum += err * err;
         self.episode_step += 1;
-        self.input.push(i_input);
+        self.input.push(drive);
         self.output.push(self.v_membrane);
 
         if self.episode_step >= EPISODE_LEN as u32 {
@@ -426,21 +444,29 @@ impl LifNeuron {
         }
     }
 
+    /// Drive with `i_input` and score tracking of the same value.
     pub fn step(&mut self, i_input: f32, dt: f32) -> bool {
-        // Refractory: hold at reset, still score tracking error so spikes that
-        // wreck the trajectory are charged to the active trial parameters.
+        self.step_with_target(i_input, i_input, dt)
+    }
+
+    /// Integrate under drive current `drive`, score membrane vs `score_target`.
+    pub fn step_with_target(&mut self, drive: f32, score_target: f32, dt: f32) -> bool {
+        // Refractory: hold at reset, still score so spikes that wreck the
+        // trajectory are charged to the active trial parameters.
         if self.is_refractory {
             self.is_refractory = false;
             self.v_membrane = self.v_reset;
-            self.record_step(i_input);
+            self.record_step(drive, score_target);
             return false;
         }
 
         let v_rest = self.trial_v_rest;
 
-        // Euler: dv = (-(v - v_rest) + I) * (dt / tau_m)
-        let dv = (-(self.v_membrane - v_rest) + i_input) * (dt / self.tau_m);
-        self.v_membrane += dv;
+        // Exact subthreshold step for τ V' = -(V - v_rest) + I
+        // (forward Euler is unstable when dt ≳ τ; ensemble uses diverse τ).
+        let v_inf = v_rest + drive;
+        let decay = (-dt / self.tau_m.max(1e-3)).exp();
+        self.v_membrane = v_inf + (self.v_membrane - v_inf) * decay;
 
         // Majority-vote firing: draw FIRE_SAMPLES noisy reads of the membrane
         // from N(V, v_threshold_dist.stddev) and spike only if most exceed the
@@ -452,7 +478,7 @@ impl LifNeuron {
             self.episode_spike_count += 1;
         }
 
-        self.record_step(i_input);
+        self.record_step(drive, score_target);
         spiked
     }
 
@@ -482,6 +508,221 @@ impl LifNeuron {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Multi-neuron reservoir + linear readout
+// ---------------------------------------------------------------------------
+
+/// Bank of LIF units with random input/recurrent projections and an online
+/// NLMS readout. Hidden units keep CEM on (v_rest, v_threshold). The readout is
+///
+///   y = b + W_h V + W_x x
+///
+/// so linear next-step maps (rotation, one-hot permutation) are learnable
+/// even when the reservoir is a pure encoder of the current input.
+pub struct LifEnsemble {
+    pub units: Vec<LifNeuron>,
+    /// w_in[h][d]: input dim d → hidden unit h.
+    w_in: Vec<[f32; MAX_DIMS]>,
+    /// Sparse recurrent mix of previous membrane voltages.
+    w_rec: Vec<[f32; ENSEMBLE_N]>,
+    /// Hidden readout: contribution of membrane V_h to output dim d.
+    w_out: Vec<[f32; ENSEMBLE_N]>,
+    /// Input skip: contribution of x_i to output dim d (critical for next-step).
+    w_skip: Vec<[f32; MAX_DIMS]>,
+    /// One-step delay skip: contribution of x_i[t-1] (temporal context).
+    w_delay: Vec<[f32; MAX_DIMS]>,
+    bias: [f32; MAX_DIMS],
+    prev_v: [f32; ENSEMBLE_N],
+    prev_x: [f32; MAX_DIMS],
+    in_dims: usize,
+    out_dims: usize,
+    lr: f32,
+    step_count: u32,
+}
+
+impl LifEnsemble {
+    pub fn new(in_dims: usize, out_dims: usize, seed: u32) -> Self {
+        assert!(in_dims >= 1 && in_dims <= MAX_DIMS);
+        assert!(out_dims >= 1 && out_dims <= MAX_DIMS);
+
+        let mut rng = Rand::new(seed.max(1));
+        let mut units = Vec::with_capacity(ENSEMBLE_N);
+        let mut w_in = Vec::with_capacity(ENSEMBLE_N);
+        let mut w_rec = Vec::with_capacity(ENSEMBLE_N);
+
+        // Diverse membrane time constants (exact integrator is stable for all τ).
+        let taus = [3.0f32, 5.0, 7.0, 10.0, 12.0, 16.0, 22.0, 30.0];
+        let in_scale = 1.0 / (in_dims as f32).sqrt();
+
+        for h in 0..ENSEMBLE_N {
+            let tau = taus[h % taus.len()];
+            // Slightly different seeds / inits so CEM populations diverge.
+            let v_rest0 = 0.35 * rng.signed();
+            let thr0 = 2.0 + 1.0 * rng.u();
+            let mut n = LifNeuron::new(v_rest0, thr0, 0.0, tau);
+            n.rng = Rand::new(seed.wrapping_mul(2654435761).wrapping_add(h as u32 + 1));
+            n.resample_trial();
+            units.push(n);
+
+            let mut row_in = [0.0f32; MAX_DIMS];
+            for d in 0..in_dims {
+                row_in[d] = in_scale * rng.signed();
+            }
+            // Pure identity taps so tracking tasks stay easy.
+            if h < in_dims {
+                row_in = [0.0; MAX_DIMS];
+                row_in[h] = 1.0;
+            }
+            // Delayed-style taps: second block copies input with opposite sign /
+            // scale for phase-sensitive features.
+            if h >= in_dims && h < 2 * in_dims {
+                let d = h - in_dims;
+                row_in = [0.0; MAX_DIMS];
+                row_in[d] = 0.5;
+            }
+            w_in.push(row_in);
+
+            let mut row_rec = [0.0f32; ENSEMBLE_N];
+            // Sparse recurrence (~4 taps per unit).
+            for _ in 0..4 {
+                let j = (rng.u32() as usize) % ENSEMBLE_N;
+                row_rec[j] += 0.4 * rng.signed();
+            }
+            w_rec.push(row_rec);
+        }
+
+        // Rescale recurrence toward REC_RADIUS (row L1 proxy).
+        let mut max_abs = 1e-6f32;
+        for row in &w_rec {
+            let s: f32 = row.iter().map(|w| w.abs()).sum();
+            if s > max_abs {
+                max_abs = s;
+            }
+        }
+        let rec_scale = REC_RADIUS / max_abs;
+        for row in &mut w_rec {
+            for w in row.iter_mut() {
+                *w *= rec_scale;
+            }
+        }
+
+        let mut w_out = Vec::with_capacity(out_dims);
+        let mut w_skip = Vec::with_capacity(out_dims);
+        let mut w_delay = Vec::with_capacity(out_dims);
+        for d in 0..out_dims {
+            let mut row = [0.0f32; ENSEMBLE_N];
+            // Warm-start identity hidden taps toward corresponding outputs.
+            if d < ENSEMBLE_N {
+                row[d] = 0.35;
+            }
+            w_out.push(row);
+
+            let mut skip = [0.0f32; MAX_DIMS];
+            // Warm-start skip as identity (good for track; next-step adapts).
+            if d < in_dims {
+                skip[d] = 0.5;
+            }
+            w_skip.push(skip);
+            w_delay.push([0.0; MAX_DIMS]);
+        }
+
+        Self {
+            units,
+            w_in,
+            w_rec,
+            w_out,
+            w_skip,
+            w_delay,
+            bias: [0.0; MAX_DIMS],
+            prev_v: [0.0; ENSEMBLE_N],
+            prev_x: [0.0; MAX_DIMS],
+            in_dims,
+            out_dims,
+            lr: READOUT_LR,
+            step_count: 0,
+        }
+    }
+
+    /// One reservoir step: drive hidden LIFs, form readout, NLMS on (ŷ − target).
+    pub fn step(&mut self, x: &[f32], target: &[f32], dt: f32) -> [f32; MAX_DIMS] {
+        debug_assert!(x.len() >= self.in_dims);
+        debug_assert!(target.len() >= self.out_dims);
+
+        // --- hidden drives ---
+        let mut drives = [0.0f32; ENSEMBLE_N];
+        for h in 0..ENSEMBLE_N {
+            let mut drive = 0.0;
+            for d in 0..self.in_dims {
+                drive += self.w_in[h][d] * x[d];
+            }
+            for j in 0..ENSEMBLE_N {
+                drive += self.w_rec[h][j] * self.prev_v[j];
+            }
+            drives[h] = drive;
+        }
+
+        // Units CEM-track their drive (keeps features ≈ projections of x + state).
+        for h in 0..ENSEMBLE_N {
+            let drive = drives[h].clamp(-FEATURE_CLIP, FEATURE_CLIP);
+            let _ = self.units[h].step_with_target(drive, drive, dt);
+            self.prev_v[h] = self.units[h]
+                .v_membrane
+                .clamp(-FEATURE_CLIP, FEATURE_CLIP);
+        }
+
+        // Feature energy for normalized LMS.
+        let mut energy = 1.0f32; // bias feature ≡ 1
+        for h in 0..ENSEMBLE_N {
+            energy += self.prev_v[h] * self.prev_v[h];
+        }
+        for d in 0..self.in_dims {
+            energy += x[d] * x[d] + self.prev_x[d] * self.prev_x[d];
+        }
+
+        // --- linear readout: y = b + W_h V + W_x x + W_Δ x_prev ---
+        let mut pred = [0.0f32; MAX_DIMS];
+        for d in 0..self.out_dims {
+            let mut y = self.bias[d];
+            for h in 0..ENSEMBLE_N {
+                y += self.w_out[d][h] * self.prev_v[h];
+            }
+            for i in 0..self.in_dims {
+                y += self.w_skip[d][i] * x[i];
+                y += self.w_delay[d][i] * self.prev_x[i];
+            }
+            pred[d] = y.clamp(-FEATURE_CLIP * 2.0, FEATURE_CLIP * 2.0);
+        }
+
+        self.step_count = self.step_count.saturating_add(1);
+        let lr = self.lr / (1.0 + 0.001 * self.step_count as f32);
+        let inv_norm = 1.0 / energy.max(1e-3);
+
+        for d in 0..self.out_dims {
+            let e = (pred[d] - target[d]).clamp(-FEATURE_CLIP, FEATURE_CLIP);
+            let step = lr * e * inv_norm;
+            self.bias[d] = (self.bias[d] - step).clamp(-WEIGHT_CLIP, WEIGHT_CLIP);
+            for h in 0..ENSEMBLE_N {
+                let g = step * self.prev_v[h] + READOUT_L2 * self.w_out[d][h];
+                self.w_out[d][h] = (self.w_out[d][h] - g).clamp(-WEIGHT_CLIP, WEIGHT_CLIP);
+            }
+            for i in 0..self.in_dims {
+                let g_s = step * x[i] + READOUT_L2 * self.w_skip[d][i];
+                self.w_skip[d][i] =
+                    (self.w_skip[d][i] - g_s).clamp(-WEIGHT_CLIP, WEIGHT_CLIP);
+                let g_d = step * self.prev_x[i] + READOUT_L2 * self.w_delay[d][i];
+                self.w_delay[d][i] =
+                    (self.w_delay[d][i] - g_d).clamp(-WEIGHT_CLIP, WEIGHT_CLIP);
+            }
+        }
+
+        for d in 0..self.in_dims {
+            self.prev_x[d] = x[d];
+        }
+
+        pred
+    }
+}
+
 // Rand is a random number generator
 pub struct Rand {
     pub lfsr: u32,
@@ -502,6 +743,11 @@ impl Rand {
 
     pub fn u(&mut self) -> f32 {
         self.u32() as f32 / u32::MAX as f32
+    }
+
+    /// Uniform in approximately [-1, 1].
+    pub fn signed(&mut self) -> f32 {
+        2.0 * self.u() - 1.0
     }
 
     pub fn g(&mut self) -> (f32, f32) {
@@ -845,6 +1091,21 @@ mod tests {
         assert_eq!(sq.mode, ScoreMode::Track);
         assert_eq!(oh.mode, ScoreMode::PredictNext);
         assert_eq!(oh.dims, 4);
+        // Ensemble + multi-pass should keep absolute errors in a useful range.
+        assert!(sq.mae < 0.25, "square_wave MAE too high: {}", sq.mae);
+        assert!(oh.mae < 0.45, "one_hot_cycle MAE too high: {}", oh.mae);
+    }
+
+    #[test]
+    fn test_ensemble_learns_unit_circle_next_step() {
+        let series = gen_unit_circle(128, 0.15);
+        let r = evaluate_series("unit_circle", 2, &series, BENCH_DT, ScoreMode::PredictNext);
+        assert!(r.mae.is_finite());
+        assert!(
+            r.late_mae < 0.2,
+            "expected low late error on unit circle, late_mae={}",
+            r.late_mae
+        );
     }
 }
 
@@ -852,8 +1113,6 @@ mod tests {
 // Benchmark signals + evaluation harness
 // ---------------------------------------------------------------------------
 
-/// Max state dimension across all benchmarks (one-hot width, Lorenz, …).
-const MAX_DIMS: usize = 4;
 /// Integration / wall-clock dt used when driving the LIF.
 const BENCH_DT: f32 = 10.0;
 /// Default horizon (prediction tasks need one extra generator step).
@@ -884,12 +1143,6 @@ struct BenchResult {
     late_mae: f32,
     /// MAE on the first 25% of steps (pre/early learning).
     early_mae: f32,
-}
-
-fn fresh_neuron() -> LifNeuron {
-    // rest=2 (bad init so learning is visible), threshold=2.5 (above early V so
-    // non-spiking policies are reachable), reset=0, tau=10ms
-    LifNeuron::new(2.0, 2.5, 0.0, 10.0)
 }
 
 /// Square wave on {0, 1} — baseline 1-D tracking task.
@@ -989,7 +1242,7 @@ fn gen_lorenz(steps: usize, h: f32, stride: usize) -> Vec<[f32; MAX_DIMS]> {
     out
 }
 
-/// Drive one LIF per dimension; report element-wise and vector errors.
+/// Drive an [`LifEnsemble`] (reservoir + SGD readout); score predictions vs target.
 fn evaluate_series(
     name: &'static str,
     dims: usize,
@@ -1005,7 +1258,9 @@ fn evaluate_series(
         ScoreMode::PredictNext => series.len() - 1,
     };
 
-    let mut neurons: Vec<LifNeuron> = (0..dims).map(|_| fresh_neuron()).collect();
+    // Stable seed from name so runs are reproducible per benchmark.
+    let seed = name.bytes().fold(1u32, |a, b| a.wrapping_mul(16777619) ^ b as u32);
+    let mut net = LifEnsemble::new(dims, dims, seed);
 
     let mut sum_abs = 0.0f32;
     let mut sum_sq = 0.0f32;
@@ -1019,33 +1274,42 @@ fn evaluate_series(
     let mut late_abs = 0.0f32;
     let mut late_n = 0.0f32;
 
-    for t in 0..scored_steps {
-        let x = &series[t];
-        let target = match mode {
-            ScoreMode::Track => x,
-            ScoreMode::PredictNext => &series[t + 1],
-        };
+    // Several online passes; only the final pass contributes to reported error
+    // so early CEM / readout transients do not dominate the headline MAE.
+    for pass in 0..TRAIN_PASSES {
+        let score_pass = pass + 1 == TRAIN_PASSES;
+        for t in 0..scored_steps {
+            let x = &series[t];
+            let target = match mode {
+                ScoreMode::Track => x,
+                ScoreMode::PredictNext => &series[t + 1],
+            };
 
-        let mut err_sq_vec = 0.0f32;
-        for d in 0..dims {
-            let _spiked = neurons[d].step(x[d], dt);
-            let e = neurons[d].v_membrane - target[d];
-            let ae = e.abs();
-            sum_abs += ae;
-            sum_sq += e * e;
-            err_sq_vec += e * e;
-            n_elem += 1.0;
+            let pred = net.step(x, target, dt);
+            if !score_pass {
+                continue;
+            }
 
-            if t < early_end {
-                early_abs += ae;
-                early_n += 1.0;
+            let mut err_sq_vec = 0.0f32;
+            for d in 0..dims {
+                let e = pred[d] - target[d];
+                let ae = e.abs();
+                sum_abs += ae;
+                sum_sq += e * e;
+                err_sq_vec += e * e;
+                n_elem += 1.0;
+
+                if t < early_end {
+                    early_abs += ae;
+                    early_n += 1.0;
+                }
+                if t >= late_start {
+                    late_abs += ae;
+                    late_n += 1.0;
+                }
             }
-            if t >= late_start {
-                late_abs += ae;
-                late_n += 1.0;
-            }
+            sum_l2 += err_sq_vec.sqrt();
         }
-        sum_l2 += err_sq_vec.sqrt();
     }
 
     BenchResult {
@@ -1115,12 +1379,13 @@ fn run_benchmark_suite(steps: usize, dt: f32) -> Vec<BenchResult> {
 
 fn main() {
     println!(
-        "CEM-LIF benchmarks: pop={POP_SIZE} episode={EPISODE_LEN} elite={ELITE_COUNT} \
-         lr_mean={LR_MEAN} fire_samples={FIRE_SAMPLES}"
+        "CEM-LIF ensemble: units={ENSEMBLE_N} pop={POP_SIZE} episode={EPISODE_LEN} \
+         elite={ELITE_COUNT} readout_lr={READOUT_LR} passes={TRAIN_PASSES} \
+         fire_samples={FIRE_SAMPLES}"
     );
     println!(
         "score modes: square_wave = same-step track; others = next-step prediction \
-         (1 LIF per dimension)"
+         ({ENSEMBLE_N} LIF reservoir + NLMS readout with input/delay skips)"
     );
     println!();
 

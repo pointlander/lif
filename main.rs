@@ -682,12 +682,9 @@ impl LifEnsemble {
         }
     }
 
-    /// One reservoir step: drive hidden LIFs, form readout, NLMS on (ŷ − target).
-    pub fn step(&mut self, x: &[f32], target: &[f32], dt: f32) -> [f32; MAX_DIMS] {
+    /// Drive LIF bank and advance delay taps (no readout weight update).
+    fn drive_reservoir(&mut self, x: &[f32], dt: f32) {
         debug_assert!(x.len() >= self.in_dims);
-        debug_assert!(target.len() >= self.out_dims);
-
-        // --- hidden drives ---
         let mut drives = [0.0f32; ENSEMBLE_N];
         for h in 0..ENSEMBLE_N {
             let mut drive = 0.0;
@@ -700,7 +697,6 @@ impl LifEnsemble {
             drives[h] = drive;
         }
 
-        // Units CEM-track their drive (keeps features ≈ projections of x + state).
         for h in 0..ENSEMBLE_N {
             let drive = drives[h].clamp(-FEATURE_CLIP, FEATURE_CLIP);
             let _ = self.units[h].step_with_target(drive, drive, dt);
@@ -709,18 +705,13 @@ impl LifEnsemble {
                 .clamp(-FEATURE_CLIP, FEATURE_CLIP);
         }
 
-        // Feature energy for normalized LMS.
-        let mut energy = 1.0f32; // bias feature ≡ 1
-        for h in 0..ENSEMBLE_N {
-            energy += self.prev_v[h] * self.prev_v[h];
-        }
         for d in 0..self.in_dims {
-            energy += x[d] * x[d]
-                + self.prev_x[d] * self.prev_x[d]
-                + self.prev2_x[d] * self.prev2_x[d];
+            self.prev2_x[d] = self.prev_x[d];
+            self.prev_x[d] = x[d];
         }
+    }
 
-        // --- linear readout: y = b + W_h V + W_x x + W_1 x_{t-1} + W_2 x_{t-2} ---
+    fn readout_pred(&self, x: &[f32]) -> [f32; MAX_DIMS] {
         let mut pred = [0.0f32; MAX_DIMS];
         for d in 0..self.out_dims {
             let mut y = self.bias[d];
@@ -733,6 +724,27 @@ impl LifEnsemble {
                 y += self.w_delay2[d][i] * self.prev2_x[i];
             }
             pred[d] = y.clamp(-FEATURE_CLIP * 2.0, FEATURE_CLIP * 2.0);
+        }
+        pred
+    }
+
+    /// One reservoir step: drive hidden LIFs, form readout, NLMS on (ŷ − target).
+    pub fn step(&mut self, x: &[f32], target: &[f32], dt: f32) -> [f32; MAX_DIMS] {
+        debug_assert!(x.len() >= self.in_dims);
+        debug_assert!(target.len() >= self.out_dims);
+
+        self.drive_reservoir(x, dt);
+        let pred = self.readout_pred(x);
+
+        // Feature energy for normalized LMS.
+        let mut energy = 1.0f32;
+        for h in 0..ENSEMBLE_N {
+            energy += self.prev_v[h] * self.prev_v[h];
+        }
+        for d in 0..self.in_dims {
+            energy += x[d] * x[d]
+                + self.prev_x[d] * self.prev_x[d]
+                + self.prev2_x[d] * self.prev2_x[d];
         }
 
         self.step_count = self.step_count.saturating_add(1);
@@ -760,12 +772,12 @@ impl LifEnsemble {
             }
         }
 
-        for d in 0..self.in_dims {
-            self.prev2_x[d] = self.prev_x[d];
-            self.prev_x[d] = x[d];
-        }
-
         pred
+    }
+
+    /// Inference step: update dynamics only (no NLMS). Used by generation / MCTS.
+    pub fn step_eval(&mut self, x: &[f32], dt: f32) {
+        self.drive_reservoir(x, dt);
     }
 
     /// Membrane features from the last reservoir step (length [`ENSEMBLE_N`]).
@@ -781,6 +793,37 @@ impl LifEnsemble {
         self.out_dims
     }
 
+    /// Snapshot dynamical state for MCTS branching (weights untouched).
+    pub fn snapshot_dynamics(&self) -> EnsembleDynamicsSnap {
+        let mut membranes = [0.0f32; ENSEMBLE_N];
+        let mut refractory = [false; ENSEMBLE_N];
+        let mut rng_states = [0u32; ENSEMBLE_N];
+        for h in 0..ENSEMBLE_N {
+            membranes[h] = self.units[h].v_membrane;
+            refractory[h] = self.units[h].is_refractory;
+            rng_states[h] = self.units[h].rng.lfsr;
+        }
+        EnsembleDynamicsSnap {
+            prev_v: self.prev_v,
+            prev_x: self.prev_x,
+            prev2_x: self.prev2_x,
+            membranes,
+            refractory,
+            rng_states,
+        }
+    }
+
+    pub fn restore_dynamics(&mut self, snap: &EnsembleDynamicsSnap) {
+        self.prev_v = snap.prev_v;
+        self.prev_x = snap.prev_x;
+        self.prev2_x = snap.prev2_x;
+        for h in 0..ENSEMBLE_N {
+            self.units[h].v_membrane = snap.membranes[h];
+            self.units[h].is_refractory = snap.refractory[h];
+            self.units[h].rng.lfsr = snap.rng_states[h];
+        }
+    }
+
     /// Clear dynamical state (membranes, delays) without wiping learned readout.
     pub fn reset_dynamics(&mut self) {
         self.prev_v = [0.0; ENSEMBLE_N];
@@ -791,6 +834,17 @@ impl LifEnsemble {
             u.is_refractory = false;
         }
     }
+}
+
+/// Pure dynamics of [`LifEnsemble`] (no readout weights).
+#[derive(Clone, Debug)]
+pub struct EnsembleDynamicsSnap {
+    prev_v: [f32; ENSEMBLE_N],
+    prev_x: [f32; MAX_DIMS],
+    prev2_x: [f32; MAX_DIMS],
+    membranes: [f32; ENSEMBLE_N],
+    refractory: [bool; ENSEMBLE_N],
+    rng_states: [u32; ENSEMBLE_N],
 }
 
 // Rand is a random number generator
@@ -843,21 +897,44 @@ const LM_EMBED_DIMS: usize = MAX_DIMS;
 /// Default training path (Project Gutenberg Shakespeare, eBook #100).
 const LM_CORPUS_PATH: &str = "100.txt.utf-8";
 /// Characters used when streaming the reservoir for RF feature collection.
-const LM_TRAIN_CHARS: usize = 400_000;
+const LM_TRAIN_CHARS: usize = 900_000;
 /// Held-out window immediately after the train prefix.
-const LM_EVAL_CHARS: usize = 40_000;
+const LM_EVAL_CHARS: usize = 50_000;
 /// Max labeled pairs fed to the random forest (reservoir still sees full prefix).
-const RF_TRAIN_SAMPLES: usize = 48_000;
+const RF_TRAIN_SAMPLES: usize = 96_000;
 /// Number of trees in the readout forest.
-const RF_N_TREES: usize = 40;
-/// Max depth of each decision tree.
-const RF_MAX_DEPTH: usize = 16;
-/// Minimum samples in a leaf.
-const RF_MIN_LEAF: usize = 6;
+const RF_N_TREES: usize = 72;
+/// Max depth of each decision tree (shallower ⇒ less memorization of id noise).
+const RF_MAX_DEPTH: usize = 12;
+/// Minimum samples in a leaf (higher ⇒ smoother policy).
+const RF_MIN_LEAF: usize = 16;
 /// Candidate thresholds tried per feature at each split.
-const RF_THR_CANDIDATES: usize = 12;
+const RF_THR_CANDIDATES: usize = 16;
 /// Generated sample length after training.
-const LM_SAMPLE_LEN: usize = 400;
+const LM_SAMPLE_LEN: usize = 180;
+/// MCTS simulations per emitted character.
+const MCTS_SIMS: usize = 96;
+/// PUCT exploration constant (slightly lower ⇒ trust value more).
+const MCTS_C_PUCT: f32 = 1.15;
+/// Expand only the top-k policy actions at each node.
+const MCTS_TOP_K: usize = 18;
+/// Stochastic rollout length (chars) after expansion (short ⇒ less noise).
+const MCTS_ROLLOUT: usize = 3;
+/// Blend weights for shaped policy: RF + bigram + unigram (should sum to 1).
+/// Bigram dominates — character LMs live or die by local co-occurrence.
+const MCTS_RF_BLEND: f32 = 0.18;
+const MCTS_BIGRAM_BLEND: f32 = 0.70;
+const MCTS_UNIGRAM_BLEND: f32 = 0.12;
+/// Multiplicative penalty on P(same char as last) unless a legal double letter.
+const MCTS_REPEAT_PRIOR: f32 = 0.55;
+/// Extra value penalty (nats) for illegal stutter.
+const MCTS_REPEAT_VALUE: f32 = 1.75;
+/// Floor probability mass reserved for non-top-k (keeps priors honest).
+const MCTS_PRIOR_FLOOR: f32 = 1e-4;
+/// Softmax temperature applied to the shaped policy before MCTS/top-k (<1 sharpens).
+const MCTS_POLICY_TEMP: f32 = 0.7;
+/// Weight of immediate action log-prob vs deeper path in the backup value.
+const MCTS_IMMEDIATE_WEIGHT: f32 = 0.65;
 
 /// Keep printable ASCII + newline (maps curly quotes etc. away upstream).
 fn is_lm_byte(b: u8) -> bool {
@@ -1276,6 +1353,12 @@ pub struct LifLanguageModel {
     embed: Vec<[f32; MAX_DIMS]>,
     prev_id: usize,
     prev2_id: usize,
+    /// Sliding window of recent char ids (diversity shaping during generation).
+    recent: Vec<usize>,
+    /// Laplace-smoothed unigram P(char) from the train stream (policy prior blend).
+    unigram: Vec<f32>,
+    /// Laplace-smoothed bigram P(next|prev): `bigram[prev][next]`.
+    bigram: Vec<Vec<f32>>,
     /// Multi-class forest over ensemble membranes + char-context features.
     pub forest: RandomForest,
     rng: Rand,
@@ -1299,6 +1382,9 @@ impl LifLanguageModel {
         }
 
         let ensemble = LifEnsemble::new(LM_EMBED_DIMS, LM_EMBED_DIMS, seed);
+        let vn = v.max(1);
+        let unigram = vec![1.0 / vn as f32; vn];
+        let bigram = vec![vec![1.0 / vn as f32; vn]; vn];
 
         Self {
             vocab,
@@ -1306,55 +1392,461 @@ impl LifLanguageModel {
             embed,
             prev_id: 0,
             prev2_id: 0,
+            recent: Vec::new(),
+            unigram,
+            bigram,
             forest: RandomForest::new(),
             rng,
         }
+    }
+
+    const RECENT_WINDOW: usize = 28;
+
+    fn push_recent(&mut self, id: usize) {
+        self.recent.push(id);
+        if self.recent.len() > Self::RECENT_WINDOW {
+            let drop = self.recent.len() - Self::RECENT_WINDOW;
+            self.recent.drain(0..drop);
+        }
+    }
+
+    fn recent_count(&self, id: usize) -> usize {
+        self.recent.iter().filter(|&&c| c == id).count()
+    }
+
+    /// Letters that commonly double in English (allow weak self-transition).
+    fn is_doubleable(b: u8) -> bool {
+        matches!(
+            b,
+            b'e' | b'l' | b's' | b'o' | b't' | b'f' | b'p' | b'r' | b'n' | b'm' | b'c' | b'd'
+                | b'E' | b'L' | b'S' | b'O' | b'T' | b'F' | b'P' | b'R' | b'N' | b'M' | b'C'
+                | b'D'
+        )
+    }
+
+    /// Linguistic / byte-shape features (ordered better than raw vocab ids for trees).
+    fn push_char_meta(f: &mut Vec<f32>, b: u8) {
+        f.push(if b.is_ascii_lowercase() { 1.0 } else { 0.0 });
+        f.push(if b.is_ascii_uppercase() { 1.0 } else { 0.0 });
+        f.push(if b.is_ascii_alphabetic() { 1.0 } else { 0.0 });
+        f.push(if b.is_ascii_digit() { 1.0 } else { 0.0 });
+        f.push(if b == b' ' { 1.0 } else { 0.0 });
+        f.push(if b == b'\n' { 1.0 } else { 0.0 });
+        f.push(if matches!(b, b'.' | b',' | b';' | b'!' | b'?' | b':' | b'\'') {
+            1.0
+        } else {
+            0.0
+        });
+        f.push(if matches!(
+            b,
+            b'a' | b'e' | b'i' | b'o' | b'u' | b'A' | b'E' | b'I' | b'O' | b'U'
+        ) {
+            1.0
+        } else {
+            0.0
+        });
+        // Smooth byte code in [0,1] (letters cluster; better than sparse id index).
+        f.push(b as f32 / 127.0);
     }
 
     fn embed_char(&self, char_id: usize) -> [f32; MAX_DIMS] {
         self.embed[char_id.min(self.embed.len().saturating_sub(1))]
     }
 
-    /// Drive the ensemble with the char embedding; optionally track next embed.
+    /// Drive the ensemble with the char embedding; optionally track next embed (train).
     fn drive_char(&mut self, char_id: usize, target_id: Option<usize>) {
         let x = self.embed_char(char_id);
-        let t = match target_id {
-            Some(id) => self.embed_char(id),
-            None => x,
-        };
-        let _ = self.ensemble.step(&x, &t, LM_DT);
+        match target_id {
+            Some(id) => {
+                let t = self.embed_char(id);
+                let _ = self.ensemble.step(&x, &t, LM_DT);
+            }
+            None => {
+                // Inference / MCTS: dynamics only, freeze NLMS weights.
+                self.ensemble.step_eval(&x, LM_DT);
+            }
+        }
     }
 
-    /// Feature vector for the forest: ensemble membranes + current/prev char ids.
+    /// Feature vector: ensemble membranes + linguistic meta for current/prev/prev2.
     fn features(&self, char_id: usize) -> Vec<f32> {
         let hidden = self.ensemble.hidden_state();
-        let mut f = Vec::with_capacity(hidden.len() + 2);
+        let mut f = Vec::with_capacity(hidden.len() + 9 * 3);
         f.extend_from_slice(hidden);
-        f.push(char_id as f32);
-        f.push(self.prev_id as f32);
+        let cur = self.vocab.decode(char_id);
+        let prev = self.vocab.decode(self.prev_id);
+        let prev2 = self.vocab.decode(self.prev2_id);
+        Self::push_char_meta(&mut f, cur);
+        Self::push_char_meta(&mut f, prev);
+        Self::push_char_meta(&mut f, prev2);
         f
+    }
+
+    /// Shape RF probabilities for search: RF + bigram + unigram + anti-repetition.
+    fn shape_policy(&self, rf: Vec<f32>, last_char: usize) -> Vec<f32> {
+        let n = rf.len();
+        if n == 0 {
+            return rf;
+        }
+        let mut p = vec![0.0f32; n];
+        let prev = last_char.min(self.bigram.len().saturating_sub(1));
+        for i in 0..n {
+            let u = self.unigram.get(i).copied().unwrap_or(1.0 / n as f32);
+            let bi = self
+                .bigram
+                .get(prev)
+                .and_then(|row| row.get(i))
+                .copied()
+                .unwrap_or(u);
+            let r = rf.get(i).copied().unwrap_or(u);
+            p[i] = MCTS_RF_BLEND * r + MCTS_BIGRAM_BLEND * bi + MCTS_UNIGRAM_BLEND * u;
+        }
+        let last_b = self.vocab.decode(last_char);
+        if last_char < n {
+            let allow = Self::is_doubleable(last_b) || last_b == b' ' || last_b == b'\n';
+            if !allow {
+                p[last_char] *= 1.0 - MCTS_REPEAT_PRIOR;
+            } else {
+                p[last_char] *= 1.0 - 0.15 * MCTS_REPEAT_PRIOR;
+            }
+        }
+        // Break short cycles: ... x y x  and  ... x y z x
+        if self.prev_id < n {
+            p[self.prev_id] *= 0.40;
+        }
+        if self.prev2_id < n {
+            p[self.prev2_id] *= 0.55;
+        }
+        // Diversity: downweight chars over-used in the recent window.
+        for i in 0..n {
+            let c = self.recent_count(i);
+            if c > 0 {
+                p[i] *= 1.0 / (1.0 + 0.85 * c as f32);
+            }
+        }
+        // Soft ban of control-ish bytes that are not space/newline.
+        for i in 0..n {
+            let b = self.vocab.decode(i);
+            if b < 32 && b != b'\n' {
+                p[i] *= 0.02;
+            }
+            // Discourage ALL-CAPS runs that dominate Shakespeare stage directions.
+            if b.is_ascii_uppercase() && last_b.is_ascii_uppercase() {
+                p[i] *= 0.45;
+            }
+            // Prefer space after sentence punctuation.
+            if matches!(last_b, b'.' | b'!' | b'?' | b':' | b';') && b == b' ' {
+                p[i] *= 1.8;
+            }
+            // Prefer letter after space (start of word).
+            if last_b == b' ' && b.is_ascii_alphabetic() {
+                p[i] *= 1.35;
+            }
+            // Prefer lowercase continuation after lowercase (word body).
+            if last_b.is_ascii_lowercase() && b.is_ascii_lowercase() {
+                p[i] *= 1.15;
+            }
+        }
+        // After finishing "the ", strongly downweight restarting "the".
+        if last_b == b' ' {
+            let p1 = self.vocab.decode(self.prev_id);
+            let p2 = self.vocab.decode(self.prev2_id);
+            if p2 == b'h' && p1 == b'e' {
+                for i in 0..n {
+                    if self.vocab.decode(i) == b't' {
+                        p[i] *= 0.15;
+                    }
+                }
+            }
+            // Same for "and ", "an ".
+            if (p2 == b'n' && p1 == b'd') || (p2 == b'a' && p1 == b'n') {
+                for i in 0..n {
+                    let b = self.vocab.decode(i);
+                    if b == b'a' || b == b't' {
+                        p[i] *= 0.35;
+                    }
+                }
+            }
+        }
+        // Temperature sharpening of the mixture prior.
+        let inv_t = 1.0 / MCTS_POLICY_TEMP.max(1e-3);
+        let mut max = f32::NEG_INFINITY;
+        for &x in &p {
+            let z = x.max(1e-12).ln() * inv_t;
+            if z > max {
+                max = z;
+            }
+        }
+        let mut s = 0.0f32;
+        for x in &mut p {
+            *x = ((*x).max(1e-12).ln() * inv_t - max).exp();
+            s += *x;
+        }
+        if s > 0.0 {
+            for x in &mut p {
+                *x /= s;
+            }
+        }
+        p
     }
 
     fn reset_state(&mut self) {
         self.ensemble.reset_dynamics();
         self.prev_id = 0;
         self.prev2_id = 0;
+        self.recent.clear();
     }
 
-    /// Drive ensemble on `char_id`, return forest class probabilities for next char.
-    pub fn observe(&mut self, char_id: usize) -> Vec<f32> {
-        // Track current embedding (no teacher target at inference).
-        self.drive_char(char_id, None);
+    fn snapshot_lm(&self) -> LmDynamicsSnap {
+        LmDynamicsSnap {
+            ensemble: self.ensemble.snapshot_dynamics(),
+            prev_id: self.prev_id,
+            prev2_id: self.prev2_id,
+            recent: self.recent.clone(),
+            rng_lfsr: self.rng.lfsr,
+        }
+    }
+
+    fn restore_lm(&mut self, snap: &LmDynamicsSnap) {
+        self.ensemble.restore_dynamics(&snap.ensemble);
+        self.prev_id = snap.prev_id;
+        self.prev2_id = snap.prev2_id;
+        self.recent = snap.recent.clone();
+        self.rng.lfsr = snap.rng_lfsr;
+    }
+
+    /// Raw RF (or unigram) policy — used for eval metrics.
+    fn rf_policy(&self, char_id: usize) -> Vec<f32> {
         let feats = self.features(char_id);
-        let probs = if self.forest.is_trained() {
+        if self.forest.is_trained() {
             self.forest.predict_proba(&feats)
         } else {
-            let v = self.vocab.len().max(1);
-            vec![1.0 / v as f32; v]
-        };
+            self.unigram.clone()
+        }
+    }
+
+    /// Search policy: RF + n-gram blend + anti-repetition / diversity shaping.
+    fn policy_from_features(&self, char_id: usize) -> Vec<f32> {
+        self.shape_policy(self.rf_policy(char_id), char_id)
+    }
+
+    /// Drive ensemble on `char_id`, return **raw** RF probs (for eval).
+    pub fn observe(&mut self, char_id: usize) -> Vec<f32> {
+        self.drive_char(char_id, None);
+        let probs = self.rf_policy(char_id);
         self.prev2_id = self.prev_id;
         self.prev_id = char_id;
+        self.push_recent(char_id);
         probs
+    }
+
+    /// Like [`observe`] but returns the shaped search policy (generation / MCTS).
+    fn observe_search(&mut self, char_id: usize) -> Vec<f32> {
+        self.drive_char(char_id, None);
+        let probs = self.policy_from_features(char_id);
+        self.prev2_id = self.prev_id;
+        self.prev_id = char_id;
+        self.push_recent(char_id);
+        probs
+    }
+
+    fn sample_from_probs(&mut self, probs: &[f32], temperature: f32) -> usize {
+        if temperature <= 1e-6 {
+            return argmax_f32(probs);
+        }
+        let inv_t = 1.0 / temperature.max(1e-3);
+        let mut logits: Vec<f32> = probs
+            .iter()
+            .map(|p| p.max(1e-12).ln() * inv_t)
+            .collect();
+        let mut max = f32::NEG_INFINITY;
+        for &z in &logits {
+            if z > max {
+                max = z;
+            }
+        }
+        let mut sum = 0.0f32;
+        for z in &mut logits {
+            *z = (*z - max).exp();
+            sum += *z;
+        }
+        let inv = 1.0 / sum.max(1e-12);
+        for z in &mut logits {
+            *z *= inv;
+        }
+        let mut r = self.rng.u();
+        let mut pick = logits.len() - 1;
+        for (i, &p) in logits.iter().enumerate() {
+            if r < p {
+                pick = i;
+                break;
+            }
+            r -= p;
+        }
+        pick
+    }
+
+    /// Top-k action indices by probability (descending).
+    fn top_k_actions(probs: &[f32], k: usize) -> Vec<usize> {
+        let mut idx: Vec<usize> = (0..probs.len()).collect();
+        idx.sort_by(|&a, &b| {
+            probs[b]
+                .partial_cmp(&probs[a])
+                .unwrap_or(core::cmp::Ordering::Equal)
+        });
+        idx.truncate(k.min(probs.len()));
+        idx
+    }
+
+    /// Choose next char with Monte Carlo Tree Search (PUCT + RF policy prior).
+    ///
+    /// Value = mean log-probability along the path + rollout (higher is better).
+    /// Only the top-[`MCTS_TOP_K`] policy actions are expanded at each node.
+    fn mcts_select_action(&mut self, last_char: usize, temperature: f32) -> usize {
+        let root_snap = self.snapshot_lm();
+        let root_prior = self.policy_from_features(last_char);
+        let root_actions = Self::top_k_actions(&root_prior, MCTS_TOP_K);
+
+        let mut nodes: Vec<MctsNode> = vec![MctsNode {
+            action: 0,
+            prior: 1.0,
+            n: 0.0,
+            w: 0.0,
+            children: Vec::new(),
+            unexpanded: root_actions
+                .iter()
+                .map(|&a| (a, root_prior[a].max(1e-8)))
+                .collect(),
+        }];
+
+        for _ in 0..MCTS_SIMS {
+            self.restore_lm(&root_snap);
+            let mut path: Vec<usize> = vec![0];
+            let mut node = 0usize;
+            let mut path_logp = 0.0f32;
+            let mut cur_char = last_char;
+
+            // Selection: PUCT among fully expanded interiors.
+            while nodes[node].unexpanded.is_empty() && !nodes[node].children.is_empty() {
+                let parent_n = nodes[node].n.max(1.0);
+                let mut best_child = nodes[node].children[0];
+                let mut best_score = f32::NEG_INFINITY;
+                for &ch in &nodes[node].children {
+                    let c = &nodes[ch];
+                    let q = if c.n > 0.0 { c.w / c.n } else { 0.0 };
+                    let u = MCTS_C_PUCT * c.prior * parent_n.sqrt() / (1.0 + c.n);
+                    let score = q + u;
+                    if score > best_score {
+                        best_score = score;
+                        best_child = ch;
+                    }
+                }
+                let act = nodes[best_child].action;
+                let probs = self.policy_from_features(cur_char);
+                let mut lp = probs.get(act).copied().unwrap_or(1e-12).max(1e-12).ln();
+                if act == cur_char && !Self::is_doubleable(self.vocab.decode(cur_char)) {
+                    lp -= MCTS_REPEAT_VALUE;
+                }
+                path_logp += lp;
+                let _ = self.observe_search(act);
+                cur_char = act;
+                path.push(best_child);
+                node = best_child;
+            }
+
+            // Expansion: open one untried action (highest prior).
+            let mut first_step_lp = 0.0f32;
+            if !nodes[node].unexpanded.is_empty() {
+                let mut pick = 0usize;
+                let mut best_p = -1.0f32;
+                for (i, &(_, p)) in nodes[node].unexpanded.iter().enumerate() {
+                    if p > best_p {
+                        best_p = p;
+                        pick = i;
+                    }
+                }
+                let (act, prior) = nodes[node].unexpanded.swap_remove(pick);
+                let probs = self.policy_from_features(cur_char);
+                let mut lp = probs.get(act).copied().unwrap_or(1e-12).max(1e-12).ln();
+                if act == cur_char && !Self::is_doubleable(self.vocab.decode(cur_char)) {
+                    lp -= MCTS_REPEAT_VALUE;
+                }
+                // Remember immediate log-prob for root-child value emphasis.
+                if path.len() == 1 {
+                    first_step_lp = lp;
+                }
+                path_logp += lp;
+                let _ = self.observe_search(act);
+                cur_char = act;
+
+                let child_prior = self.policy_from_features(cur_char);
+                let child_actions = Self::top_k_actions(&child_prior, MCTS_TOP_K);
+                let child = nodes.len();
+                nodes.push(MctsNode {
+                    action: act,
+                    prior: prior.max(MCTS_PRIOR_FLOOR),
+                    n: 0.0,
+                    w: 0.0,
+                    children: Vec::new(),
+                    unexpanded: child_actions
+                        .iter()
+                        .map(|&a| (a, child_prior[a].max(MCTS_PRIOR_FLOOR)))
+                        .collect(),
+                });
+                nodes[node].children.push(child);
+                path.push(child);
+            }
+
+            // Short rollout (mild temperature; shaped policy).
+            let mut rollout_logp = 0.0f32;
+            let mut rc = cur_char;
+            let roll_temp = temperature.clamp(0.5, 0.75);
+            for _ in 0..MCTS_ROLLOUT {
+                let probs = self.policy_from_features(rc);
+                let a = self.sample_from_probs(&probs, roll_temp);
+                let mut lp = probs.get(a).copied().unwrap_or(1e-12).max(1e-12).ln();
+                if a == rc && !Self::is_doubleable(self.vocab.decode(rc)) {
+                    lp -= MCTS_REPEAT_VALUE;
+                }
+                rollout_logp += lp;
+                let _ = self.observe_search(a);
+                rc = a;
+            }
+
+            let deep_steps = (path.len().saturating_sub(1) + MCTS_ROLLOUT).max(1) as f32;
+            let deep = (path_logp + rollout_logp) / deep_steps;
+            // Emphasize the first chosen action's quality (what we actually emit).
+            let value = if first_step_lp != 0.0 {
+                MCTS_IMMEDIATE_WEIGHT * first_step_lp
+                    + (1.0 - MCTS_IMMEDIATE_WEIGHT) * deep
+            } else {
+                deep
+            };
+
+            for &ni in path.iter().rev() {
+                nodes[ni].n += 1.0;
+                nodes[ni].w += value;
+            }
+        }
+
+        self.restore_lm(&root_snap);
+
+        if nodes[0].children.is_empty() {
+            return argmax_f32(&root_prior);
+        }
+        // Prefer high visit count; break ties with Q and prior.
+        let mut best_a = nodes[nodes[0].children[0]].action;
+        let mut best_score = f32::NEG_INFINITY;
+        for &ch in &nodes[0].children {
+            let c = &nodes[ch];
+            let q = if c.n > 0.0 { c.w / c.n } else { f32::NEG_INFINITY };
+            let score = c.n + 0.35 * q + 0.5 * c.prior.ln();
+            if score > best_score {
+                best_score = score;
+                best_a = c.action;
+            }
+        }
+        best_a
     }
 
     /// Stream chars through [`LifEnsemble`], collect features, fit RF readout.
@@ -1378,12 +1870,45 @@ impl LifLanguageModel {
         let mut xs: Vec<Vec<f32>> = Vec::with_capacity(RF_TRAIN_SAMPLES);
         let mut ys: Vec<usize> = Vec::with_capacity(RF_TRAIN_SAMPLES);
 
+        // Corpus n-grams for MCTS prior blending.
+        let v = self.vocab.len().max(1);
+        let mut uni = vec![1.0f32; v]; // Laplace
+        let mut bi = vec![vec![1.0f32; v]; v];
+        for i in 0..data.len().saturating_sub(1) {
+            let a = self.vocab.encode(data[i]);
+            let b = self.vocab.encode(data[i + 1]);
+            if a < v {
+                uni[a] += 1.0;
+            }
+            if a < v && b < v {
+                bi[a][b] += 1.0;
+            }
+        }
+        // last char still counts for unigram
+        if let Some(&last) = data.last() {
+            let id = self.vocab.encode(last);
+            if id < v {
+                uni[id] += 1.0;
+            }
+        }
+        let uni_tot: f32 = uni.iter().sum::<f32>().max(1.0);
+        self.unigram = uni.iter().map(|c| c / uni_tot).collect();
+        self.bigram = bi
+            .iter()
+            .map(|row| {
+                let t: f32 = row.iter().sum::<f32>().max(1.0);
+                row.iter().map(|c| c / t).collect()
+            })
+            .collect();
+
+        // Warm-up the ensemble before collecting RF features.
+        let warmup = (n_pairs / 20).min(20_000);
         for i in 0..n_pairs {
             let a = self.vocab.encode(data[i]);
             let b = self.vocab.encode(data[i + 1]);
             // Teacher-force next embedding so the ensemble adapts online.
             self.drive_char(a, Some(b));
-            if i % stride == 0 && xs.len() < RF_TRAIN_SAMPLES {
+            if i >= warmup && i % stride == 0 && xs.len() < RF_TRAIN_SAMPLES {
                 xs.push(self.features(a));
                 ys.push(b);
             }
@@ -1447,7 +1972,11 @@ impl LifLanguageModel {
         }
     }
 
-    /// Sample `n` bytes continuing from `prompt` (greedy if temperature ≤ 0).
+    /// Generate `n` bytes after `prompt` with **Monte Carlo Tree Search**.
+    ///
+    /// For each character, runs [`MCTS_SIMS`] simulations with PUCT selection,
+    /// RF policy priors, and stochastic rollouts. `temperature` controls rollout
+    /// sampling only; the emitted token is the root child with most visits.
     pub fn generate(&mut self, prompt: &[u8], n: usize, temperature: f32) -> Vec<u8> {
         self.reset_state();
 
@@ -1455,51 +1984,45 @@ impl LifLanguageModel {
         if out.is_empty() {
             out.push(b' ');
         }
-        let mut probs = Vec::new();
         for &b in &out {
-            probs = self.observe(self.vocab.encode(b));
+            let _ = self.observe_search(self.vocab.encode(b));
         }
+        let mut last = self.vocab.encode(*out.last().unwrap());
 
         for _ in 0..n {
-            let next = if temperature <= 1e-6 {
-                argmax_f32(&probs)
-            } else {
-                let inv_t = 1.0 / temperature.max(1e-3);
-                let mut logits: Vec<f32> = probs
-                    .iter()
-                    .map(|p| p.max(1e-12).ln() * inv_t)
-                    .collect();
-                let mut max = f32::NEG_INFINITY;
-                for &z in &logits {
-                    if z > max {
-                        max = z;
-                    }
-                }
-                let mut sum = 0.0f32;
-                for z in &mut logits {
-                    *z = (*z - max).exp();
-                    sum += *z;
-                }
-                let inv = 1.0 / sum.max(1e-12);
-                for z in &mut logits {
-                    *z *= inv;
-                }
-                let mut r = self.rng.u();
-                let mut pick = logits.len() - 1;
-                for (i, &p) in logits.iter().enumerate() {
-                    if r < p {
-                        pick = i;
-                        break;
-                    }
-                    r -= p;
-                }
-                pick
-            };
+            let next = self.mcts_select_action(last, temperature);
             out.push(self.vocab.decode(next));
-            probs = self.observe(next);
+            let _ = self.observe_search(next);
+            last = next;
         }
         out
     }
+}
+
+/// LM dynamics snapshot for MCTS (ensemble + char history + RNG).
+#[derive(Clone, Debug)]
+struct LmDynamicsSnap {
+    ensemble: EnsembleDynamicsSnap,
+    prev_id: usize,
+    prev2_id: usize,
+    recent: Vec<usize>,
+    rng_lfsr: u32,
+}
+
+/// One node in the character-level MCTS tree.
+struct MctsNode {
+    /// Action (char id) from parent → this node (unused at root).
+    action: usize,
+    /// Policy prior P(action | parent).
+    prior: f32,
+    /// Visit count.
+    n: f32,
+    /// Total backed-up value.
+    w: f32,
+    /// Expanded children (arena indices).
+    children: Vec<usize>,
+    /// Remaining (action, prior) pairs to expand.
+    unexpanded: Vec<(usize, f32)>,
 }
 
 /// Train + evaluate + sample from `100.txt.utf-8` (or a provided path).
@@ -1548,19 +2071,14 @@ fn run_language_model(path: &str) -> Result<(), String> {
     );
 
     let prompt = b"To be, or not to be";
-    let sample_hot = model.generate(prompt, LM_SAMPLE_LEN, 0.7);
-    let sample_greedy = {
-        // Fresh continuation for greedy (re-prime inside generate).
-        model.generate(prompt, LM_SAMPLE_LEN / 2, 0.0)
-    };
     println!();
-    println!("sample greedy (temp=0):");
+    println!(
+        "MCTS generate: sims={MCTS_SIMS} top_k={MCTS_TOP_K} rollout={MCTS_ROLLOUT} c_puct={MCTS_C_PUCT}"
+    );
+    let sample_mcts = model.generate(prompt, LM_SAMPLE_LEN, 0.7);
+    println!("sample MCTS (rollout_temp=0.7, prompt+{LM_SAMPLE_LEN} bytes):");
     println!("----");
-    println!("{}", String::from_utf8_lossy(&sample_greedy));
-    println!("----");
-    println!("sample (temp=0.7, prompt+{LM_SAMPLE_LEN} bytes):");
-    println!("----");
-    println!("{}", String::from_utf8_lossy(&sample_hot));
+    println!("{}", String::from_utf8_lossy(&sample_mcts));
     println!("----");
     println!(
         "{{lm: {{\"train_acc\": {:.6}, \"eval_acc\": {:.6}, \"eval_ppl\": {:.4}, \"vocab\": {}}}}}",
@@ -1953,7 +2471,8 @@ mod tests {
         assert!(stats.perplexity.is_finite() && stats.perplexity >= 1.0);
         assert!(model.forest.is_trained());
 
-        let sample = model.generate(b"to be", 32, 0.5);
+        // Short MCTS sample (few sims still exercise the path).
+        let sample = model.generate(b"to be", 8, 0.5);
         assert!(sample.len() > 5);
         assert!(std::str::from_utf8(&sample).is_ok());
     }

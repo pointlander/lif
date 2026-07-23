@@ -894,6 +894,11 @@ impl Rand {
 const LM_DT: f32 = 10.0;
 /// Dense char embedding size (must be ≤ [`MAX_DIMS`] for [`LifEnsemble`]).
 const LM_EMBED_DIMS: usize = MAX_DIMS;
+/// Sliding text block length (chars) over which the adjacency matrix is formed.
+const LM_BLOCK_SIZE: usize = 32;
+/// Project ensemble membranes to this dim before forming the adjacency Gram
+/// (keeps RF feature size manageable: K(K+1)/2 + K).
+const LM_ADJ_PROJ: usize = 16;
 /// Default training path (Project Gutenberg Shakespeare, eBook #100).
 const LM_CORPUS_PATH: &str = "100.txt.utf-8";
 /// Characters used when streaming the reservoir for RF feature collection.
@@ -901,7 +906,7 @@ const LM_TRAIN_CHARS: usize = 900_000;
 /// Held-out window immediately after the train prefix.
 const LM_EVAL_CHARS: usize = 50_000;
 /// Max labeled pairs fed to the random forest (reservoir still sees full prefix).
-const RF_TRAIN_SAMPLES: usize = 96_000;
+const RF_TRAIN_SAMPLES: usize = 80_000;
 /// Number of trees in the readout forest.
 const RF_N_TREES: usize = 72;
 /// Max depth of each decision tree (shallower ⇒ less memorization of id noise).
@@ -1343,8 +1348,9 @@ fn build_node(
     me
 }
 
-/// Next-character LM: [`LifEnsemble`] encodes char embeddings; **random forest**
-/// classifies the next symbol from ensemble membrane features.
+/// Next-character LM: text is processed in **blocks** through [`LifEnsemble`];
+/// a unit–unit **adjacency matrix** is accumulated from membrane co-activation
+/// and vectorized as the embedding for the **random forest** classifier.
 pub struct LifLanguageModel {
     pub vocab: CharVocab,
     /// Shared LIF bank + NLMS embedding tracker (`LM_EMBED_DIMS` I/O).
@@ -1355,11 +1361,19 @@ pub struct LifLanguageModel {
     prev2_id: usize,
     /// Sliding window of recent char ids (diversity shaping during generation).
     recent: Vec<usize>,
+    /// Ring buffer of the last [`LM_BLOCK_SIZE`] **projected** membrane vectors.
+    v_block: Vec<[f32; LM_ADJ_PROJ]>,
+    /// Fixed random projection ENSEMBLE_N → LM_ADJ_PROJ for adjacency features.
+    adj_proj: [[f32; ENSEMBLE_N]; LM_ADJ_PROJ],
+    /// Number of valid entries currently in `v_block` (≤ LM_BLOCK_SIZE).
+    v_block_len: usize,
+    /// Write index into the ring.
+    v_block_pos: usize,
     /// Laplace-smoothed unigram P(char) from the train stream (policy prior blend).
     unigram: Vec<f32>,
     /// Laplace-smoothed bigram P(next|prev): `bigram[prev][next]`.
     bigram: Vec<Vec<f32>>,
-    /// Multi-class forest over ensemble membranes + char-context features.
+    /// Multi-class forest over **adjacency embeddings** (+ light char meta).
     pub forest: RandomForest,
     rng: Rand,
 }
@@ -1367,6 +1381,7 @@ pub struct LifLanguageModel {
 impl LifLanguageModel {
     pub fn new(vocab: CharVocab, seed: u32) -> Self {
         assert!(LM_EMBED_DIMS >= 1 && LM_EMBED_DIMS <= MAX_DIMS);
+        assert!(LM_BLOCK_SIZE >= 2);
         let v = vocab.len();
         let mut rng = Rand::new(seed.max(1));
 
@@ -1386,6 +1401,15 @@ impl LifLanguageModel {
         let unigram = vec![1.0 / vn as f32; vn];
         let bigram = vec![vec![1.0 / vn as f32; vn]; vn];
 
+        // Random ±1/√H projection for compact adjacency embeddings.
+        let inv_h = 1.0 / (ENSEMBLE_N as f32).sqrt();
+        let mut adj_proj = [[0.0f32; ENSEMBLE_N]; LM_ADJ_PROJ];
+        for k in 0..LM_ADJ_PROJ {
+            for h in 0..ENSEMBLE_N {
+                adj_proj[k][h] = if rng.u() < 0.5 { -inv_h } else { inv_h };
+            }
+        }
+
         Self {
             vocab,
             ensemble,
@@ -1393,6 +1417,10 @@ impl LifLanguageModel {
             prev_id: 0,
             prev2_id: 0,
             recent: Vec::new(),
+            v_block: vec![[0.0; LM_ADJ_PROJ]; LM_BLOCK_SIZE],
+            adj_proj,
+            v_block_len: 0,
+            v_block_pos: 0,
             unigram,
             bigram,
             forest: RandomForest::new(),
@@ -1412,6 +1440,90 @@ impl LifLanguageModel {
 
     fn recent_count(&self, id: usize) -> usize {
         self.recent.iter().filter(|&&c| c == id).count()
+    }
+
+    /// Project full membrane state → [`LM_ADJ_PROJ`] and store in the block ring.
+    fn record_block_state(&mut self) {
+        let h = self.ensemble.hidden_state();
+        let mut z = [0.0f32; LM_ADJ_PROJ];
+        let n = h.len().min(ENSEMBLE_N);
+        for k in 0..LM_ADJ_PROJ {
+            let mut s = 0.0f32;
+            for j in 0..n {
+                s += self.adj_proj[k][j] * h[j];
+            }
+            z[k] = s;
+        }
+        self.v_block[self.v_block_pos] = z;
+        self.v_block_pos = (self.v_block_pos + 1) % LM_BLOCK_SIZE;
+        if self.v_block_len < LM_BLOCK_SIZE {
+            self.v_block_len += 1;
+        }
+    }
+
+    /// Projected unit co-activation adjacency over the current text block.
+    ///
+    /// For projected membrane trajectories \(z_t \in \mathbb{R}^{K}\) in the block:
+    /// \(A_{ij} = \frac{1}{T}\sum_t z_t[i]\, z_t[j]\). Embedding = upper triangle
+    /// (incl. diagonal) + row-sum degrees, L2-normalized.
+    fn adjacency_embedding(&self) -> Vec<f32> {
+        let k = LM_ADJ_PROJ;
+        let mut a = vec![0.0f32; k * k];
+        if self.v_block_len == 0 {
+            let tri = k * (k + 1) / 2;
+            return vec![0.0; tri + k];
+        }
+
+        let start = if self.v_block_len < LM_BLOCK_SIZE {
+            0
+        } else {
+            self.v_block_pos
+        };
+        for t in 0..self.v_block_len {
+            let idx = (start + t) % LM_BLOCK_SIZE;
+            let z = &self.v_block[idx];
+            for i in 0..k {
+                let zi = z[i];
+                let row = i * k;
+                for j in 0..k {
+                    a[row + j] += zi * z[j];
+                }
+            }
+        }
+
+        let inv_t = 1.0 / self.v_block_len as f32;
+        for x in &mut a {
+            *x *= inv_t;
+        }
+
+        let mut deg = vec![0.0f32; k];
+        for i in 0..k {
+            let mut s = 0.0f32;
+            let row = i * k;
+            for j in 0..k {
+                s += a[row + j].abs();
+            }
+            deg[i] = s;
+        }
+
+        let mut emb = Vec::with_capacity(k * (k + 1) / 2 + k);
+        for i in 0..k {
+            let row = i * k;
+            for j in i..k {
+                emb.push(a[row + j]);
+            }
+        }
+        emb.extend_from_slice(&deg);
+
+        let mut nrm = 0.0f32;
+        for &x in &emb {
+            nrm += x * x;
+        }
+        nrm = nrm.sqrt().max(1e-6);
+        for x in &mut emb {
+            *x /= nrm;
+        }
+        emb
     }
 
     /// Letters that commonly double in English (allow weak self-transition).
@@ -1454,6 +1566,7 @@ impl LifLanguageModel {
     }
 
     /// Drive the ensemble with the char embedding; optionally track next embed (train).
+    /// Always appends the post-step membrane vector to the sliding block.
     fn drive_char(&mut self, char_id: usize, target_id: Option<usize>) {
         let x = self.embed_char(char_id);
         match target_id {
@@ -1466,13 +1579,12 @@ impl LifLanguageModel {
                 self.ensemble.step_eval(&x, LM_DT);
             }
         }
+        self.record_block_state();
     }
 
-    /// Feature vector: ensemble membranes + linguistic meta for current/prev/prev2.
+    /// Feature vector: **adjacency embedding** of the current text block + light char meta.
     fn features(&self, char_id: usize) -> Vec<f32> {
-        let hidden = self.ensemble.hidden_state();
-        let mut f = Vec::with_capacity(hidden.len() + 9 * 3);
-        f.extend_from_slice(hidden);
+        let mut f = self.adjacency_embedding();
         let cur = self.vocab.decode(char_id);
         let prev = self.vocab.decode(self.prev_id);
         let prev2 = self.vocab.decode(self.prev2_id);
@@ -1595,6 +1707,11 @@ impl LifLanguageModel {
         self.prev_id = 0;
         self.prev2_id = 0;
         self.recent.clear();
+        self.v_block_len = 0;
+        self.v_block_pos = 0;
+        for row in &mut self.v_block {
+            *row = [0.0; LM_ADJ_PROJ];
+        }
     }
 
     fn snapshot_lm(&self) -> LmDynamicsSnap {
@@ -1603,6 +1720,9 @@ impl LifLanguageModel {
             prev_id: self.prev_id,
             prev2_id: self.prev2_id,
             recent: self.recent.clone(),
+            v_block: self.v_block.clone(),
+            v_block_len: self.v_block_len,
+            v_block_pos: self.v_block_pos,
             rng_lfsr: self.rng.lfsr,
         }
     }
@@ -1612,6 +1732,9 @@ impl LifLanguageModel {
         self.prev_id = snap.prev_id;
         self.prev2_id = snap.prev2_id;
         self.recent = snap.recent.clone();
+        self.v_block = snap.v_block.clone();
+        self.v_block_len = snap.v_block_len;
+        self.v_block_pos = snap.v_block_pos;
         self.rng.lfsr = snap.rng_lfsr;
     }
 
@@ -1849,11 +1972,12 @@ impl LifLanguageModel {
         best_a
     }
 
-    /// Stream chars through [`LifEnsemble`], collect features, fit RF readout.
+    /// Stream text in sliding **blocks** through [`LifEnsemble`], form adjacency
+    /// embeddings, and fit the random-forest readout.
     ///
-    /// During collection the ensemble NLMS readout tracks the **next** char
-    /// embedding (teacher-forced), which shapes the hidden dynamics; the RF
-    /// then maps membranes → discrete next-char class.
+    /// Each step teacher-forces the next-char embedding into the ensemble; after
+    /// the block ring is warm (`LM_BLOCK_SIZE` steps), features = vectorized
+    /// co-activation adjacency + char meta, label = next character.
     pub fn train_bytes(&mut self, data: &[u8], _epochs: usize) -> LmTrainStats {
         if data.len() < 2 {
             return LmTrainStats {
@@ -1901,19 +2025,24 @@ impl LifLanguageModel {
             })
             .collect();
 
-        // Warm-up the ensemble before collecting RF features.
-        let warmup = (n_pairs / 20).min(20_000);
+        // Need a full block before adjacency embeddings are meaningful.
+        let warmup = LM_BLOCK_SIZE.max((n_pairs / 25).min(15_000));
         for i in 0..n_pairs {
             let a = self.vocab.encode(data[i]);
             let b = self.vocab.encode(data[i + 1]);
-            // Teacher-force next embedding so the ensemble adapts online.
+            // Teacher-force next embedding; records membrane into the block ring.
             self.drive_char(a, Some(b));
-            if i >= warmup && i % stride == 0 && xs.len() < RF_TRAIN_SAMPLES {
+            if i >= warmup
+                && self.v_block_len >= LM_BLOCK_SIZE
+                && i % stride == 0
+                && xs.len() < RF_TRAIN_SAMPLES
+            {
                 xs.push(self.features(a));
                 ys.push(b);
             }
             self.prev2_id = self.prev_id;
             self.prev_id = a;
+            self.push_recent(a);
         }
 
         let n_classes = self.vocab.len();
@@ -1999,13 +2128,16 @@ impl LifLanguageModel {
     }
 }
 
-/// LM dynamics snapshot for MCTS (ensemble + char history + RNG).
+/// LM dynamics snapshot for MCTS (ensemble + block adjacency buffer + RNG).
 #[derive(Clone, Debug)]
 struct LmDynamicsSnap {
     ensemble: EnsembleDynamicsSnap,
     prev_id: usize,
     prev2_id: usize,
     recent: Vec<usize>,
+    v_block: Vec<[f32; LM_ADJ_PROJ]>,
+    v_block_len: usize,
+    v_block_pos: usize,
     rng_lfsr: u32,
 }
 
@@ -2028,7 +2160,7 @@ struct MctsNode {
 /// Train + evaluate + sample from `100.txt.utf-8` (or a provided path).
 fn run_language_model(path: &str) -> Result<(), String> {
     println!();
-    println!("=== LifEnsemble character language model (RF readout) ===");
+    println!("=== LifEnsemble block-adjacency LM (RF readout) ===");
     println!("corpus: {path}");
 
     let corpus = load_corpus(path)?;
@@ -2045,28 +2177,29 @@ fn run_language_model(path: &str) -> Result<(), String> {
 
     let vocab = CharVocab::from_bytes(train);
     println!(
-        "bytes: corpus={} train={} eval={} vocab={} ensemble={} embed={} trees={} rf_samples={}",
+        "bytes: corpus={} train={} eval={} vocab={} ensemble={} embed={} block={} trees={} rf_samples={}",
         corpus.len(),
         train.len(),
         eval.len(),
         vocab.len(),
         ENSEMBLE_N,
         LM_EMBED_DIMS,
+        LM_BLOCK_SIZE,
         RF_N_TREES,
         RF_TRAIN_SAMPLES
     );
 
     let mut model = LifLanguageModel::new(vocab, 0xC0FFEE);
-    // LifEnsemble feature collection + random-forest readout fit.
+    // Block-wise LifEnsemble adjacency embeddings → random forest.
     let train_stats = model.train_bytes(train, 1);
     println!(
-        "train (ensemble+RF): tokens={}  acc={:.3}  nll={:.3}  ppl={:.2}",
+        "train (block-adj+RF): tokens={}  acc={:.3}  nll={:.3}  ppl={:.2}",
         train_stats.tokens, train_stats.accuracy, train_stats.loss, train_stats.perplexity
     );
 
     let eval_stats = model.evaluate_bytes(eval);
     println!(
-        "eval (ensemble+RF): tokens={}  acc={:.3}  nll={:.3}  ppl={:.2}",
+        "eval (block-adj+RF): tokens={}  acc={:.3}  nll={:.3}  ppl={:.2}",
         eval_stats.tokens, eval_stats.accuracy, eval_stats.loss, eval_stats.perplexity
     );
 

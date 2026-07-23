@@ -159,8 +159,8 @@ const FEATURE_CLIP: f32 = 4.0;
 const WEIGHT_CLIP: f32 = 5.0;
 /// Online passes over each series (last pass is scored).
 const TRAIN_PASSES: usize = 5;
-/// Max state dimension across benchmarks / ensemble I/O (one-hot, Lorenz, …).
-const MAX_DIMS: usize = 4;
+/// Max state dimension across benchmarks / ensemble I/O (one-hot, Lorenz, LM embeds, …).
+const MAX_DIMS: usize = 16;
 
 /// Diagonal Gaussian over one learnable scalar.
 #[derive(Clone, Copy, Debug)]
@@ -767,6 +767,30 @@ impl LifEnsemble {
 
         pred
     }
+
+    /// Membrane features from the last reservoir step (length [`ENSEMBLE_N`]).
+    pub fn hidden_state(&self) -> &[f32] {
+        &self.prev_v
+    }
+
+    pub fn in_dims(&self) -> usize {
+        self.in_dims
+    }
+
+    pub fn out_dims(&self) -> usize {
+        self.out_dims
+    }
+
+    /// Clear dynamical state (membranes, delays) without wiping learned readout.
+    pub fn reset_dynamics(&mut self) {
+        self.prev_v = [0.0; ENSEMBLE_N];
+        self.prev_x = [0.0; MAX_DIMS];
+        self.prev2_x = [0.0; MAX_DIMS];
+        for u in &mut self.units {
+            u.v_membrane = u.trial_v_rest;
+            u.is_refractory = false;
+        }
+    }
 }
 
 // Rand is a random number generator
@@ -809,15 +833,13 @@ impl Rand {
 }
 
 // ---------------------------------------------------------------------------
-// Character-level natural language model (LIF reservoir + NLMS readout)
+// Character-level natural language model (LifEnsemble + random-forest readout)
 // ---------------------------------------------------------------------------
 
-/// Hidden LIF units for the language model (larger than the toy ensemble).
-const LM_HIDDEN: usize = 96;
-/// Sparse recurrent taps per hidden unit.
-const LM_REC_TAPS: usize = 8;
-/// Integration dt for LM reservoir steps.
+/// Integration dt for LM ensemble steps.
 const LM_DT: f32 = 10.0;
+/// Dense char embedding size (must be ≤ [`MAX_DIMS`] for [`LifEnsemble`]).
+const LM_EMBED_DIMS: usize = MAX_DIMS;
 /// Default training path (Project Gutenberg Shakespeare, eBook #100).
 const LM_CORPUS_PATH: &str = "100.txt.utf-8";
 /// Characters used when streaming the reservoir for RF feature collection.
@@ -1244,132 +1266,85 @@ fn build_node(
     me
 }
 
-/// Next-character LM: LIF reservoir encodes history; **random forest** readout.
+/// Next-character LM: [`LifEnsemble`] encodes char embeddings; **random forest**
+/// classifies the next symbol from ensemble membrane features.
 pub struct LifLanguageModel {
     pub vocab: CharVocab,
-    units: Vec<LifNeuron>,
-    /// w_in[char_id][h] — column layout for one-hot input.
-    w_in: Vec<Vec<f32>>,
-    rec_idx: Vec<[usize; LM_REC_TAPS]>,
-    rec_w: Vec<[f32; LM_REC_TAPS]>,
-    prev_v: Vec<f32>,
+    /// Shared LIF bank + NLMS embedding tracker (`LM_EMBED_DIMS` I/O).
+    pub ensemble: LifEnsemble,
+    /// Fixed random embedding table: vocab id → dense vector ≤ [`MAX_DIMS`].
+    embed: Vec<[f32; MAX_DIMS]>,
     prev_id: usize,
     prev2_id: usize,
-    hidden: usize,
-    /// Multi-class forest over reservoir + char-context features.
+    /// Multi-class forest over ensemble membranes + char-context features.
     pub forest: RandomForest,
     rng: Rand,
 }
 
 impl LifLanguageModel {
     pub fn new(vocab: CharVocab, seed: u32) -> Self {
+        assert!(LM_EMBED_DIMS >= 1 && LM_EMBED_DIMS <= MAX_DIMS);
         let v = vocab.len();
-        let h = LM_HIDDEN;
         let mut rng = Rand::new(seed.max(1));
-        let mut units = Vec::with_capacity(h);
-        let taus = [4.0f32, 6.0, 8.0, 10.0, 14.0, 18.0, 24.0, 32.0];
-        let in_scale = 1.15 / (v as f32).sqrt();
 
-        for i in 0..h {
-            let tau = taus[i % taus.len()];
-            let mut n = LifNeuron::new(0.2 * rng.signed(), 2.2 + rng.u(), 0.0, tau);
-            n.rng = Rand::new(seed.wrapping_mul(2246822519).wrapping_add(i as u32 + 3));
-            n.resample_trial();
-            units.push(n);
-        }
-
-        let mut w_in = Vec::with_capacity(v);
+        // Random unit-scale embeddings in the ensemble's input space.
+        let mut embed = Vec::with_capacity(v);
+        let scale = 1.0 / (LM_EMBED_DIMS as f32).sqrt();
         for _ in 0..v {
-            let mut col = vec![0.0f32; h];
-            for hh in 0..h {
-                col[hh] = in_scale * rng.signed();
+            let mut e = [0.0f32; MAX_DIMS];
+            for d in 0..LM_EMBED_DIMS {
+                e[d] = scale * rng.signed();
             }
-            w_in.push(col);
+            embed.push(e);
         }
 
-        let mut rec_idx = Vec::with_capacity(h);
-        let mut rec_w = Vec::with_capacity(h);
-        for _ in 0..h {
-            let mut idx = [0usize; LM_REC_TAPS];
-            let mut wts = [0.0f32; LM_REC_TAPS];
-            for t in 0..LM_REC_TAPS {
-                idx[t] = (rng.u32() as usize) % h;
-                wts[t] = 0.45 * rng.signed();
-            }
-            let s: f32 = wts.iter().map(|w| w.abs()).sum::<f32>().max(1e-3);
-            let scale = REC_RADIUS / s;
-            for t in 0..LM_REC_TAPS {
-                wts[t] *= scale;
-            }
-            rec_idx.push(idx);
-            rec_w.push(wts);
-        }
-
-        for n in &mut units {
-            n.v_rest_dist.stddev = STD_MIN;
-            n.v_threshold_dist.stddev = STD_MIN;
-            n.trial_v_rest = n.v_rest_dist.mean;
-            n.trial_v_threshold = n.v_threshold_dist.mean.max(n.v_reset + 0.1);
-            if n.trial_v_threshold < 2.5 {
-                n.trial_v_threshold = 2.5;
-                n.v_threshold_dist.mean = 2.5;
-            }
-        }
+        let ensemble = LifEnsemble::new(LM_EMBED_DIMS, LM_EMBED_DIMS, seed);
 
         Self {
             vocab,
-            units,
-            w_in,
-            rec_idx,
-            rec_w,
-            prev_v: vec![0.0; h],
+            ensemble,
+            embed,
             prev_id: 0,
             prev2_id: 0,
-            hidden: h,
             forest: RandomForest::new(),
             rng,
         }
     }
 
-    fn drive_hidden(&mut self, char_id: usize) {
-        let col = &self.w_in[char_id];
-        let col_prev = &self.w_in[self.prev_id];
-        for h in 0..self.hidden {
-            let mut drive = col[h] + 0.45 * col_prev[h];
-            for t in 0..LM_REC_TAPS {
-                let j = self.rec_idx[h][t];
-                drive += self.rec_w[h][t] * self.prev_v[j];
-            }
-            let drive = drive.clamp(-FEATURE_CLIP, FEATURE_CLIP);
-            let _ = self.units[h].step_with_target(drive, drive, LM_DT);
-            self.prev_v[h] = self.units[h].v_membrane.clamp(-FEATURE_CLIP, FEATURE_CLIP);
-        }
+    fn embed_char(&self, char_id: usize) -> [f32; MAX_DIMS] {
+        self.embed[char_id.min(self.embed.len().saturating_sub(1))]
     }
 
-    /// Feature vector for the forest: membranes + current/prev char ids.
+    /// Drive the ensemble with the char embedding; optionally track next embed.
+    fn drive_char(&mut self, char_id: usize, target_id: Option<usize>) {
+        let x = self.embed_char(char_id);
+        let t = match target_id {
+            Some(id) => self.embed_char(id),
+            None => x,
+        };
+        let _ = self.ensemble.step(&x, &t, LM_DT);
+    }
+
+    /// Feature vector for the forest: ensemble membranes + current/prev char ids.
     fn features(&self, char_id: usize) -> Vec<f32> {
-        let mut f = Vec::with_capacity(self.hidden + 2);
-        f.extend_from_slice(&self.prev_v);
+        let hidden = self.ensemble.hidden_state();
+        let mut f = Vec::with_capacity(hidden.len() + 2);
+        f.extend_from_slice(hidden);
         f.push(char_id as f32);
         f.push(self.prev_id as f32);
         f
     }
 
     fn reset_state(&mut self) {
-        for v in &mut self.prev_v {
-            *v = 0.0;
-        }
+        self.ensemble.reset_dynamics();
         self.prev_id = 0;
         self.prev2_id = 0;
-        for u in &mut self.units {
-            u.v_membrane = u.trial_v_rest;
-            u.is_refractory = false;
-        }
     }
 
-    /// Drive reservoir on `char_id`, return forest class probabilities for next char.
+    /// Drive ensemble on `char_id`, return forest class probabilities for next char.
     pub fn observe(&mut self, char_id: usize) -> Vec<f32> {
-        self.drive_hidden(char_id);
+        // Track current embedding (no teacher target at inference).
+        self.drive_char(char_id, None);
         let feats = self.features(char_id);
         let probs = if self.forest.is_trained() {
             self.forest.predict_proba(&feats)
@@ -1382,10 +1357,11 @@ impl LifLanguageModel {
         probs
     }
 
-    /// Collect reservoir features then fit the random-forest readout.
+    /// Stream chars through [`LifEnsemble`], collect features, fit RF readout.
     ///
-    /// `epochs` is accepted for API compatibility; the forest is fit once on a
-    /// subsample of reservoir states (bagging provides the ensemble).
+    /// During collection the ensemble NLMS readout tracks the **next** char
+    /// embedding (teacher-forced), which shapes the hidden dynamics; the RF
+    /// then maps membranes → discrete next-char class.
     pub fn train_bytes(&mut self, data: &[u8], _epochs: usize) -> LmTrainStats {
         if data.len() < 2 {
             return LmTrainStats {
@@ -1405,7 +1381,8 @@ impl LifLanguageModel {
         for i in 0..n_pairs {
             let a = self.vocab.encode(data[i]);
             let b = self.vocab.encode(data[i + 1]);
-            self.drive_hidden(a);
+            // Teacher-force next embedding so the ensemble adapts online.
+            self.drive_char(a, Some(b));
             if i % stride == 0 && xs.len() < RF_TRAIN_SAMPLES {
                 xs.push(self.features(a));
                 ys.push(b);
@@ -1418,7 +1395,6 @@ impl LifLanguageModel {
         self.forest
             .fit(&xs, &ys, n_classes, RF_N_TREES, &mut self.rng);
 
-        // Training-set metrics on the same feature rows used to fit (in-bag estimate).
         let mut hits = 0u64;
         let mut nll_sum = 0.0f64;
         for (x, &y) in xs.iter().zip(ys.iter()) {
@@ -1488,7 +1464,6 @@ impl LifLanguageModel {
             let next = if temperature <= 1e-6 {
                 argmax_f32(&probs)
             } else {
-                // Temperature sharpening on forest probabilities.
                 let inv_t = 1.0 / temperature.max(1e-3);
                 let mut logits: Vec<f32> = probs
                     .iter()
@@ -1530,7 +1505,7 @@ impl LifLanguageModel {
 /// Train + evaluate + sample from `100.txt.utf-8` (or a provided path).
 fn run_language_model(path: &str) -> Result<(), String> {
     println!();
-    println!("=== LIF character language model ===");
+    println!("=== LifEnsemble character language model (RF readout) ===");
     println!("corpus: {path}");
 
     let corpus = load_corpus(path)?;
@@ -1547,27 +1522,28 @@ fn run_language_model(path: &str) -> Result<(), String> {
 
     let vocab = CharVocab::from_bytes(train);
     println!(
-        "bytes: corpus={} train={} eval={} vocab={} hidden={} trees={} rf_samples={}",
+        "bytes: corpus={} train={} eval={} vocab={} ensemble={} embed={} trees={} rf_samples={}",
         corpus.len(),
         train.len(),
         eval.len(),
         vocab.len(),
-        LM_HIDDEN,
+        ENSEMBLE_N,
+        LM_EMBED_DIMS,
         RF_N_TREES,
         RF_TRAIN_SAMPLES
     );
 
     let mut model = LifLanguageModel::new(vocab, 0xC0FFEE);
-    // Reservoir feature collection + random-forest readout fit.
+    // LifEnsemble feature collection + random-forest readout fit.
     let train_stats = model.train_bytes(train, 1);
     println!(
-        "train (RF fit): tokens={}  acc={:.3}  nll={:.3}  ppl={:.2}",
+        "train (ensemble+RF): tokens={}  acc={:.3}  nll={:.3}  ppl={:.2}",
         train_stats.tokens, train_stats.accuracy, train_stats.loss, train_stats.perplexity
     );
 
     let eval_stats = model.evaluate_bytes(eval);
     println!(
-        "eval (LIF+RF): tokens={}  acc={:.3}  nll={:.3}  ppl={:.2}",
+        "eval (ensemble+RF): tokens={}  acc={:.3}  nll={:.3}  ppl={:.2}",
         eval_stats.tokens, eval_stats.accuracy, eval_stats.loss, eval_stats.perplexity
     );
 

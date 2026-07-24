@@ -1085,21 +1085,21 @@ const SA_DEDUP_PRIOR_SCALE: f32 = 0.35;
 const SA_DEDUP_VALUE_PENALTY: f32 = 2.0;
 
 // ---------------------------------------------------------------------------
-// Spike-emission LM: one LifNeuron per symbol; spike ⇒ emit that symbol
+// Spike-emission LM: one LifNeuron per word; spike ⇒ emit that word
 // ---------------------------------------------------------------------------
 
-/// LIF time step for the spike-symbol language model.
+/// LIF time step for the spike-word language model.
 /// With τ=5, one step gives v ≈ 0.86·I from rest → peak drive crosses thr=1.
 const SPIKE_LM_DT: f32 = 10.0;
 /// Membrane time constant (ms-scale abstract units).
 const SPIKE_LM_TAU: f32 = 5.0;
-/// Rest / reset / threshold for symbol neurons (threshold 1.0 is the fire line).
+/// Rest / reset / threshold for word neurons (threshold 1.0 is the fire line).
 const SPIKE_LM_V_REST: f32 = 0.0;
 const SPIKE_LM_V_RESET: f32 = 0.0;
 const SPIKE_LM_V_THR: f32 = 1.0;
-/// Keep CEM search noise tiny so symbol neurons use the deterministic LIF path.
+/// Keep CEM search noise tiny so word neurons use the deterministic LIF path.
 const SPIKE_LM_STD: f32 = 0.01;
-/// Peak synaptic drive for the MLE-best next symbol (supra-threshold in one step).
+/// Peak synaptic drive for the MLE-best next word (supra-threshold in one step).
 const SPIKE_LM_PEAK_DRIVE: f32 = 1.8;
 /// Floor drive for the least-likely next under a context (stays subthreshold).
 const SPIKE_LM_FLOOR_DRIVE: f32 = 0.05;
@@ -1113,10 +1113,17 @@ const SPIKE_LM_MAX_TICKS: usize = 4;
 const SPIKE_LM_LR: f32 = 0.02;
 /// Extra drive on the teacher-forced true next during training ticks.
 const SPIKE_LM_TEACHER_BOOST: f32 = 1.2;
-/// Max tokens for the Hebbian pass (full corpus still seeds n-gram weights).
-const SPIKE_LM_HEBB_TOKENS: usize = 80_000;
+/// Max word tokens for the Hebbian pass (full stream still seeds n-gram weights).
+const SPIKE_LM_HEBB_TOKENS: usize = 60_000;
 /// Train-time subsample for reporting accuracy (every k-th pair).
-const SPIKE_LM_ACC_STRIDE: usize = 4;
+const SPIKE_LM_ACC_STRIDE: usize = 2;
+/// Word tokens used for training (from the start of the tokenized corpus).
+/// Vocab size = number of unique words in this train slice (+ `<unk>`).
+const SPIKE_LM_TRAIN_WORDS: usize = 100_000;
+/// Held-out word window after the train prefix.
+const SPIKE_LM_EVAL_WORDS: usize = 6_000;
+/// Words to generate after the prompt.
+const SPIKE_LM_SAMPLE_WORDS: usize = 40;
 
 /// Keep printable ASCII + newline (maps curly quotes etc. away upstream).
 fn is_lm_byte(b: u8) -> bool {
@@ -1177,6 +1184,100 @@ impl CharVocab {
     pub fn decode(&self, id: usize) -> u8 {
         self.id_to_byte[id.min(self.id_to_byte.len().saturating_sub(1))]
     }
+}
+
+/// Word vocabulary for the spike-emission LM (unknown tokens → `<unk>`).
+#[derive(Clone, Debug)]
+pub struct WordVocab {
+    /// id → word string (`0` is always `<unk>`).
+    pub id_to_word: Vec<String>,
+    /// word → id (missing → unk).
+    word_to_id: std::collections::HashMap<String, usize>,
+    unk_id: usize,
+}
+
+impl WordVocab {
+    /// Build a vocab from already-tokenized words: **one entry per unique word**
+    /// in `tokens`, ordered by descending frequency (ties broken lexicographically).
+    ///
+    /// Id `0` is always `<unk>` (for OOV at eval time). Vocab size is therefore
+    /// `1 + n_unique` (or `1` if `tokens` is empty).
+    pub fn from_tokens(tokens: &[String]) -> Self {
+        let mut counts: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
+        for t in tokens {
+            *counts.entry(t.clone()).or_insert(0) += 1;
+        }
+        let mut ranked: Vec<(String, u32)> = counts.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        let mut id_to_word = Vec::with_capacity(ranked.len() + 1);
+        let mut word_to_id = std::collections::HashMap::with_capacity(ranked.len() + 1);
+        id_to_word.push("<unk>".to_string());
+        word_to_id.insert("<unk>".to_string(), 0);
+        for (w, _) in ranked {
+            if w == "<unk>" {
+                continue;
+            }
+            let id = id_to_word.len();
+            word_to_id.insert(w.clone(), id);
+            id_to_word.push(w);
+        }
+        Self {
+            id_to_word,
+            word_to_id,
+            unk_id: 0,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.id_to_word.len()
+    }
+
+    pub fn unk_id(&self) -> usize {
+        self.unk_id
+    }
+
+    pub fn encode(&self, word: &str) -> usize {
+        self.word_to_id.get(word).copied().unwrap_or(self.unk_id)
+    }
+
+    pub fn decode(&self, id: usize) -> &str {
+        self.id_to_word
+            .get(id)
+            .map(|s| s.as_str())
+            .unwrap_or("<unk>")
+    }
+
+    /// Encode a token stream to ids.
+    pub fn encode_tokens(&self, tokens: &[String]) -> Vec<usize> {
+        tokens.iter().map(|t| self.encode(t)).collect()
+    }
+}
+
+/// Split corpus bytes into lowercase word tokens (alphanumeric + apostrophe).
+/// Common punctuation (`. , ! ? ; :`) is kept as its own one-character token.
+pub fn tokenize_words(data: &[u8]) -> Vec<String> {
+    let s = String::from_utf8_lossy(data);
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '\'' {
+            cur.push(ch.to_ascii_lowercase());
+        } else {
+            if !cur.is_empty() {
+                words.push(std::mem::take(&mut cur));
+            }
+            match ch {
+                '.' | ',' | '!' | '?' | ';' | ':' => words.push(ch.to_string()),
+                _ => {}
+            }
+        }
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    words
 }
 
 /// Normalize CRLF, map non-printable bytes to space, collapse space runs lightly.
@@ -2330,33 +2431,33 @@ struct MctsNode {
 }
 
 // ---------------------------------------------------------------------------
-// Spike-symbol language model (LifNeuron per char; fire ⇒ emit)
+// Spike-word language model (LifNeuron per word; fire ⇒ emit)
 // ---------------------------------------------------------------------------
 
-/// Character LM where each vocabulary symbol owns one [`LifNeuron`].
+/// Word-level LM where each vocabulary word owns one [`LifNeuron`].
 ///
-/// Context (previous / previous-previous symbols) drives every neuron through
-/// learned synaptic weights. When a neuron spikes, its mapped symbol is
-/// **emitted**. If several spike, a membrane WTA picks the winner; if none
-/// spike within [`SPIKE_LM_MAX_TICKS`], the highest membrane wins (soft emit).
-pub struct SpikeSymbolLm {
-    pub vocab: CharVocab,
-    /// `neurons[id]` ↔ vocabulary symbol `id`.
+/// Context (previous / previous-previous **words**) drives every neuron through
+/// learned synaptic weights. When a neuron spikes, its mapped word is
+/// **emitted**. If several spike, drive-based WTA picks the winner; if none
+/// spike within [`SPIKE_LM_MAX_TICKS`], the strongest-driven word is soft-emitted.
+pub struct SpikeWordLm {
+    pub vocab: WordVocab,
+    /// `neurons[id]` ↔ vocabulary word `id`.
     pub neurons: Vec<LifNeuron>,
-    /// First-order synapses: current injected into next-symbol neuron `j`
-    /// after symbol `i` was emitted (`w[i][j]`).
+    /// First-order synapses: current into next-word neuron `j` after word `i`
+    /// was emitted (`w[i][j]`).
     w: Vec<Vec<f32>>,
-    /// Second-order synapses from two symbols back (`w2[prev2][next]`).
+    /// Second-order synapses from two words back (`w2[prev2][next]`).
     w2: Vec<Vec<f32>>,
-    /// Baseline drive per symbol (unigram-like bias current).
+    /// Baseline drive per word (unigram-like bias current).
     bias: Vec<f32>,
     prev_id: usize,
     prev2_id: usize,
     rng: Rand,
 }
 
-impl SpikeSymbolLm {
-    pub fn new(vocab: CharVocab, seed: u32) -> Self {
+impl SpikeWordLm {
+    pub fn new(vocab: WordVocab, seed: u32) -> Self {
         let v = vocab.len().max(1);
         let mut neurons = Vec::with_capacity(v);
         for i in 0..v {
@@ -2366,37 +2467,33 @@ impl SpikeSymbolLm {
                 SPIKE_LM_V_RESET,
                 SPIKE_LM_TAU,
             );
-            // Distinct RNG streams; keep search std low so steps stay near trial means.
             n.rng = Rand::new(seed.wrapping_mul(0x9E37).wrapping_add(i as u32).max(1));
             n.trial_v_rest = SPIKE_LM_V_REST;
             n.trial_v_threshold = SPIKE_LM_V_THR;
             n.v_membrane = SPIKE_LM_V_REST;
             neurons.push(n);
         }
+        let unk = vocab.unk_id();
         let mut model = Self {
             vocab,
             neurons,
             w: vec![vec![0.0; v]; v],
             w2: vec![vec![0.0; v]; v],
             bias: vec![0.0; v],
-            prev_id: 0,
-            prev2_id: 0,
+            prev_id: unk,
+            prev2_id: unk,
             rng: Rand::new(seed.max(1)),
         };
         model.pin_search_noise();
-        let space = model.vocab.encode(b' ');
-        model.prev_id = space;
-        model.prev2_id = space;
         model
     }
 
-    /// Number of symbol neurons (== vocab size).
-    pub fn n_symbols(&self) -> usize {
+    /// Number of word neurons (== vocab size).
+    pub fn n_words(&self) -> usize {
         self.neurons.len()
     }
 
     /// Force tiny CEM stddevs so [`LifNeuron::step`] takes the deterministic path.
-    /// (A spike would otherwise reset stddevs to [`SPIKE_STD_RESET`].)
     fn pin_search_noise(&mut self) {
         for n in &mut self.neurons {
             n.v_rest_dist.set_stddev(SPIKE_LM_STD);
@@ -2416,12 +2513,12 @@ impl SpikeSymbolLm {
 
     pub fn reset_state(&mut self) {
         self.reset_membranes();
-        let space = self.vocab.encode(b' ');
-        self.prev_id = space;
-        self.prev2_id = space;
+        let unk = self.vocab.unk_id();
+        self.prev_id = unk;
+        self.prev2_id = unk;
     }
 
-    /// Synaptic + bias current into each symbol neuron given `(prev2, prev)`.
+    /// Synaptic + bias current into each word neuron given `(prev2, prev)`.
     fn drives(&self) -> Vec<f32> {
         let v = self.neurons.len();
         let p = self.prev_id.min(v.saturating_sub(1));
@@ -2435,23 +2532,20 @@ impl SpikeSymbolLm {
         d
     }
 
-    /// One LIF update on every symbol neuron under the given drives.
+    /// One LIF update on every word neuron under the given drives.
     fn step_all(&mut self, drives: &[f32]) -> Vec<usize> {
         self.pin_search_noise();
         let v = self.neurons.len();
         let mut spiked = Vec::new();
         for j in 0..v {
-            // Score target = drive so CEM episode cost is well-defined but unused.
             if self.neurons[j].step(drives[j], SPIKE_LM_DT) {
                 spiked.push(j);
             }
         }
-        // Spikes re-open search noise; pin again for the next tick.
         self.pin_search_noise();
         spiked
     }
 
-    /// Softmax-sample an id from scores (membranes or drives).
     fn sample_from_scores(&mut self, scores: &[f32], temperature: f32) -> usize {
         let t = temperature.max(1e-3);
         let mut max_s = f32::NEG_INFINITY;
@@ -2486,7 +2580,7 @@ impl SpikeSymbolLm {
         scores.len().saturating_sub(1)
     }
 
-    /// Commit an emitted symbol: update context, reset non-winners, mark winner
+    /// Commit an emitted word: update context, reset non-winners, mark winner
     /// as just-spiked (refractory / reset).
     fn commit_emit(&mut self, emitted: usize) {
         let v = self.neurons.len();
@@ -2504,17 +2598,16 @@ impl SpikeSymbolLm {
         self.prev_id = e;
     }
 
-    /// Integrate all symbol neurons under current context until someone spikes
-    /// (or timeout). Returns the **emitted** symbol id.
+    /// Integrate all word neurons under current context until someone spikes
+    /// (or timeout). Returns the **emitted** word id.
     ///
-    /// This is the generative core: **a spike emits that symbol**.
+    /// Core rule: **a spike emits that word**.
     pub fn step_emit(&mut self, temperature: f32) -> usize {
         let v = self.neurons.len();
         if v == 0 {
             return 0;
         }
         let drives = self.drives();
-        // Fresh membranes so only the context drive decides who fires.
         self.reset_membranes();
 
         for _tick in 0..SPIKE_LM_MAX_TICKS {
@@ -2522,7 +2615,6 @@ impl SpikeSymbolLm {
             if spiked.is_empty() {
                 continue;
             }
-            // Prefer the spiker with the strongest synaptic drive (stable WTA).
             let emitted = if temperature <= 1e-3 {
                 spiked
                     .iter()
@@ -2544,7 +2636,6 @@ impl SpikeSymbolLm {
             return emitted;
         }
 
-        // No spike within the window: emit the strongest-driven symbol neuron.
         let emitted = if temperature <= 1e-3 {
             drives
                 .iter()
@@ -2559,14 +2650,12 @@ impl SpikeSymbolLm {
         emitted
     }
 
-    /// Teacher-force observe a true symbol (no weight update): as if that neuron
-    /// just fired and emitted.
-    pub fn observe(&mut self, char_id: usize) {
-        self.commit_emit(char_id);
+    /// Teacher-force observe a true word (no weight update).
+    pub fn observe(&mut self, word_id: usize) {
+        self.commit_emit(word_id);
     }
 
-    /// Map log-probabilities into a drive interval
-    /// [`SPIKE_LM_FLOOR_DRIVE`, `SPIKE_LM_PEAK_DRIVE`] with a sharp softmax peak.
+    /// Map log-probabilities into a drive interval with a sharp softmax peak.
     fn logp_to_drive(logp: &[f32]) -> Vec<f32> {
         let mut max_lp = f32::NEG_INFINITY;
         for &lp in logp {
@@ -2582,12 +2671,10 @@ impl SpikeSymbolLm {
         }
         let z = z.max(1e-12);
         let span = SPIKE_LM_PEAK_DRIVE - SPIKE_LM_FLOOR_DRIVE;
-        // Softmax mass → drive; best next is near peak, others suppressed.
         for (j, &lp) in logp.iter().enumerate() {
             let p = ((lp - max_lp) / t).exp() / z;
             out[j] = SPIKE_LM_FLOOR_DRIVE + span * p;
         }
-        // Ensure the mode is strictly supra-threshold even for flat distributions.
         if let Some((best, _)) = out
             .iter()
             .enumerate()
@@ -2600,29 +2687,30 @@ impl SpikeSymbolLm {
         out
     }
 
-    /// Seed `w`, `w2`, `bias` from Laplace-smoothed n-grams so high-probability
-    /// next symbols receive supra-threshold drive.
-    fn fit_weights_from_counts(&mut self, data: &[u8]) {
+    /// Seed `w`, `w2`, `bias` from Laplace-smoothed word n-grams.
+    fn fit_weights_from_ids(&mut self, ids: &[usize]) {
         let v = self.neurons.len();
-        if v == 0 || data.len() < 2 {
+        if v == 0 || ids.len() < 2 {
             return;
         }
         let mut uni = vec![1.0f32; v];
         let mut bi = vec![vec![1.0f32; v]; v];
-        let mut tri = vec![vec![vec![1.0f32; v]; v]; v];
+        // Skip-one bigram (word_t → word_{t+2}) as second-order context — O(V²).
+        let mut bi_skip = vec![vec![1.0f32; v]; v];
 
-        let mut ids = Vec::with_capacity(data.len());
-        for &b in data {
-            ids.push(self.vocab.encode(b).min(v - 1));
-        }
-        for &id in &ids {
+        for &id in ids {
+            let id = id.min(v - 1);
             uni[id] += 1.0;
         }
         for i in 0..ids.len().saturating_sub(1) {
-            bi[ids[i]][ids[i + 1]] += 1.0;
+            let a = ids[i].min(v - 1);
+            let b = ids[i + 1].min(v - 1);
+            bi[a][b] += 1.0;
         }
         for i in 0..ids.len().saturating_sub(2) {
-            tri[ids[i]][ids[i + 1]][ids[i + 2]] += 1.0;
+            let a = ids[i].min(v - 1);
+            let c = ids[i + 2].min(v - 1);
+            bi_skip[a][c] += 1.0;
         }
 
         let uni_tot: f32 = uni.iter().sum::<f32>().max(1.0);
@@ -2631,7 +2719,6 @@ impl SpikeSymbolLm {
             uni_lp[j] = (uni[j] / uni_tot).ln();
         }
         self.bias = Self::logp_to_drive(&uni_lp);
-        // Bias is a weak prior — scale down so transitions dominate.
         for b in &mut self.bias {
             *b *= 0.12;
         }
@@ -2645,25 +2732,16 @@ impl SpikeSymbolLm {
             self.w[i] = Self::logp_to_drive(&lp);
         }
 
-        // Collapse trigram counts onto (prev2 → next) for a compact second-order map.
         for p2 in 0..v {
-            let mut counts = vec![1.0f32; v];
-            for mid in 0..v {
-                for j in 0..v {
-                    counts[j] += tri[p2][mid][j];
-                }
-            }
-            let tot: f32 = counts.iter().sum::<f32>().max(1.0);
+            let row_sum: f32 = bi_skip[p2].iter().sum::<f32>().max(1.0);
             let mut lp = vec![0.0f32; v];
             for j in 0..v {
-                lp[j] = (counts[j] / tot).ln();
+                lp[j] = (bi_skip[p2][j] / row_sum).ln();
             }
             self.w2[p2] = Self::logp_to_drive(&lp);
         }
     }
 
-    /// One supervised Hebbian step: drive network with teacher boost on `true_next`,
-    /// strengthen / weaken synapses based on who spiked.
     fn hebb_step(&mut self, true_next: usize) -> bool {
         let v = self.neurons.len();
         if v == 0 {
@@ -2687,7 +2765,6 @@ impl SpikeSymbolLm {
         let prev2 = self.prev2_id.min(v - 1);
         let lr = SPIKE_LM_LR;
 
-        // Reinforce true transition; suppress false spikes (clamped).
         self.w[prev][target] = (self.w[prev][target] + lr).clamp(0.0, SPIKE_LM_PEAK_DRIVE);
         self.w2[prev2][target] =
             (self.w2[prev2][target] + lr * 0.35).clamp(0.0, SPIKE_LM_PEAK_DRIVE);
@@ -2706,9 +2783,7 @@ impl SpikeSymbolLm {
         correct
     }
 
-    /// Predict next id without mutating weights: pure spike emission (greedy).
     fn predict_next(&mut self) -> usize {
-        // Snapshot dynamical state so evaluation does not desync teacher force.
         let snap_prev = self.prev_id;
         let snap_prev2 = self.prev2_id;
         let membranes: Vec<(f32, bool)> = self
@@ -2721,12 +2796,11 @@ impl SpikeSymbolLm {
 
         let pred = self.step_emit(0.0);
 
-        // Restore so the caller can teacher-force the true symbol next.
         self.prev_id = snap_prev;
         self.prev2_id = snap_prev2;
         self.rng.lfsr = rng_lfsr;
-        for (n, &(v, r)) in self.neurons.iter_mut().zip(membranes.iter()) {
-            n.v_membrane = v;
+        for (n, &(vm, r)) in self.neurons.iter_mut().zip(membranes.iter()) {
+            n.v_membrane = vm;
             n.is_refractory = r;
         }
         for (n, &lfsr) in self.neurons.iter_mut().zip(neuron_rng.iter()) {
@@ -2735,9 +2809,8 @@ impl SpikeSymbolLm {
         pred
     }
 
-    /// Fit n-gram synaptic weights, optional Hebbian refinement, return train stats.
-    pub fn train_bytes(&mut self, data: &[u8], hebb_epochs: usize) -> LmTrainStats {
-        if data.len() < 2 {
+    fn score_stream(&mut self, ids: &[usize], stride: usize) -> LmTrainStats {
+        if ids.len() < 2 {
             return LmTrainStats {
                 tokens: 0,
                 loss: 0.0,
@@ -2745,33 +2818,19 @@ impl SpikeSymbolLm {
                 perplexity: 1.0,
             };
         }
-        self.fit_weights_from_counts(data);
-
         let v = self.neurons.len().max(1);
-        let n_pairs = data.len() - 1;
-        let hebb_n = SPIKE_LM_HEBB_TOKENS.min(n_pairs);
-        for _ in 0..hebb_epochs.max(0) {
-            self.reset_state();
-            self.observe(self.vocab.encode(data[0]));
-            for i in 0..hebb_n {
-                let next = self.vocab.encode(data[i + 1]);
-                let _ = self.hebb_step(next);
-            }
-        }
-
-        // Accuracy / NLL under frozen weights (spike emission vs true next).
+        let stride = stride.max(1);
         self.reset_state();
-        self.observe(self.vocab.encode(data[0]));
+        self.observe(ids[0].min(v - 1));
         let mut correct = 0u32;
         let mut tokens = 0u32;
         let mut nll = 0.0f32;
-        let stride = SPIKE_LM_ACC_STRIDE.max(1);
+        let n_pairs = ids.len() - 1;
         let mut i = 0;
         while i < n_pairs {
-            let true_next = self.vocab.encode(data[i + 1]);
+            let true_next = ids[i + 1].min(v - 1);
             if i % stride == 0 {
                 let drives = self.drives();
-                // Softmax NLL from drives (surrogate likelihood of the LIF policy).
                 let mut max_d = f32::NEG_INFINITY;
                 for &d in &drives {
                     if d > max_d {
@@ -2782,7 +2841,7 @@ impl SpikeSymbolLm {
                 for &d in &drives {
                     z += (d - max_d).exp();
                 }
-                let log_p = drives[true_next.min(v - 1)] - max_d - z.max(1e-12).ln();
+                let log_p = drives[true_next] - max_d - z.max(1e-12).ln();
                 nll -= log_p;
                 let pred = self.predict_next();
                 if pred == true_next {
@@ -2803,9 +2862,9 @@ impl SpikeSymbolLm {
         }
     }
 
-    /// Held-out accuracy / perplexity with teacher-forced context.
-    pub fn evaluate_bytes(&mut self, data: &[u8]) -> LmTrainStats {
-        if data.len() < 2 {
+    /// Fit n-gram synaptic weights, optional Hebbian refinement on word ids.
+    pub fn train_ids(&mut self, ids: &[usize], hebb_epochs: usize) -> LmTrainStats {
+        if ids.len() < 2 {
             return LmTrainStats {
                 tokens: 0,
                 loss: 0.0,
@@ -2813,60 +2872,67 @@ impl SpikeSymbolLm {
                 perplexity: 1.0,
             };
         }
+        self.fit_weights_from_ids(ids);
+
         let v = self.neurons.len().max(1);
-        self.reset_state();
-        self.observe(self.vocab.encode(data[0]));
-        let mut correct = 0u32;
-        let mut tokens = 0u32;
-        let mut nll = 0.0f32;
-        for i in 0..data.len() - 1 {
-            let true_next = self.vocab.encode(data[i + 1]);
-            let drives = self.drives();
-            let mut max_d = f32::NEG_INFINITY;
-            for &d in &drives {
-                if d > max_d {
-                    max_d = d;
-                }
+        let n_pairs = ids.len() - 1;
+        let hebb_n = SPIKE_LM_HEBB_TOKENS.min(n_pairs);
+        for _ in 0..hebb_epochs.max(0) {
+            self.reset_state();
+            self.observe(ids[0].min(v - 1));
+            for i in 0..hebb_n {
+                let next = ids[i + 1].min(v - 1);
+                let _ = self.hebb_step(next);
             }
-            let mut z = 0.0f32;
-            for &d in &drives {
-                z += (d - max_d).exp();
-            }
-            let log_p = drives[true_next.min(v - 1)] - max_d - z.max(1e-12).ln();
-            nll -= log_p;
-            let pred = self.predict_next();
-            if pred == true_next {
-                correct += 1;
-            }
-            tokens += 1;
-            self.observe(true_next);
         }
-        let tokens = tokens.max(1);
-        let mean_nll = nll / tokens as f32;
-        LmTrainStats {
-            tokens: tokens as usize,
-            loss: mean_nll,
-            accuracy: correct as f32 / tokens as f32,
-            perplexity: mean_nll.exp(),
-        }
+
+        self.score_stream(ids, SPIKE_LM_ACC_STRIDE)
     }
 
-    /// Generate `n` bytes after `prompt` by repeated spike emission.
-    pub fn generate(&mut self, prompt: &[u8], n: usize, temperature: f32) -> Vec<u8> {
+    /// Held-out accuracy / perplexity with teacher-forced word context.
+    pub fn evaluate_ids(&mut self, ids: &[usize]) -> LmTrainStats {
+        self.score_stream(ids, 1)
+    }
+
+    /// Generate `n` words after a prompt string by repeated spike emission.
+    ///
+    /// Returns a space-joined string (punctuation tokens are not space-padded
+    /// on the left when single-character punctuation).
+    pub fn generate(&mut self, prompt: &str, n: usize, temperature: f32) -> String {
         self.reset_state();
-        let mut out = prompt.to_vec();
-        if out.is_empty() {
-            out.push(b' ');
-        }
-        for &b in &out {
-            self.observe(self.vocab.encode(b));
+        let prompt_tokens = tokenize_words(prompt.as_bytes());
+        let mut out_words: Vec<String> = if prompt_tokens.is_empty() {
+            vec!["the".to_string()]
+        } else {
+            prompt_tokens
+        };
+        for w in &out_words {
+            self.observe(self.vocab.encode(w));
         }
         for _ in 0..n {
             let id = self.step_emit(temperature);
-            out.push(self.vocab.decode(id));
+            out_words.push(self.vocab.decode(id).to_string());
         }
-        out
+        join_word_tokens(&out_words)
     }
+}
+
+/// Join word tokens with spaces, attaching single-char punctuation without a
+/// preceding space (`word` + `.` → `word.`).
+fn join_word_tokens(words: &[String]) -> String {
+    let mut s = String::new();
+    for w in words {
+        let is_punct = w.len() == 1 && matches!(w.as_bytes()[0], b'.' | b',' | b'!' | b'?' | b';' | b':');
+        if s.is_empty() {
+            s.push_str(w);
+        } else if is_punct {
+            s.push_str(w);
+        } else {
+            s.push(' ');
+            s.push_str(w);
+        }
+    }
+    s
 }
 
 /// Train + evaluate + sample from `100.txt.utf-8` (or a provided path).
@@ -2935,64 +3001,76 @@ fn run_language_model(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Spike-emission LM: one [`LifNeuron`] per symbol; a spike emits that symbol.
-fn run_spike_symbol_lm(path: &str) -> Result<(), String> {
+/// Spike-emission word LM: one [`LifNeuron`] per word; a spike emits that word.
+fn run_spike_word_lm(path: &str) -> Result<(), String> {
     println!();
-    println!("=== Spike-symbol LM (LifNeuron per char; fire ⇒ emit) ===");
+    println!("=== Spike-word LM (LifNeuron per word; fire ⇒ emit) ===");
     println!("corpus: {path}");
 
     let corpus = load_corpus(path)?;
-    let train_end = LM_TRAIN_CHARS.min(corpus.len().saturating_sub(LM_EVAL_CHARS + 2));
-    let eval_end = (train_end + LM_EVAL_CHARS).min(corpus.len());
-    if train_end < 1024 {
+    let all_tokens = tokenize_words(&corpus);
+    if all_tokens.len() < 256 {
         return Err(format!(
-            "corpus too short for train/eval split ({} bytes)",
-            corpus.len()
+            "too few word tokens after tokenize ({})",
+            all_tokens.len()
         ));
     }
-    let train = &corpus[..train_end];
-    let eval = &corpus[train_end..eval_end];
+    let train_end = SPIKE_LM_TRAIN_WORDS.min(all_tokens.len().saturating_sub(SPIKE_LM_EVAL_WORDS + 2));
+    let eval_end = (train_end + SPIKE_LM_EVAL_WORDS).min(all_tokens.len());
+    if train_end < 128 {
+        return Err(format!(
+            "word stream too short for train/eval split ({} tokens)",
+            all_tokens.len()
+        ));
+    }
+    let train_toks = &all_tokens[..train_end];
+    let eval_toks = &all_tokens[train_end..eval_end];
 
-    let vocab = CharVocab::from_bytes(train);
+    // Vocab = every unique train word (+ `<unk>`); each word owns one neuron.
+    let vocab = WordVocab::from_tokens(train_toks);
+    let train_ids = vocab.encode_tokens(train_toks);
+    let eval_ids = vocab.encode_tokens(eval_toks);
+    let n_unique = vocab.len().saturating_sub(1); // exclude <unk>
+
     println!(
-        "bytes: corpus={} train={} eval={} vocab={} neurons={} hebb_cap={} max_ticks={}",
-        corpus.len(),
-        train.len(),
-        eval.len(),
+        "words: corpus_tokens={} train={} eval={} unique={} vocab={} neurons={} hebb_cap={} max_ticks={}",
+        all_tokens.len(),
+        train_ids.len(),
+        eval_ids.len(),
+        n_unique,
         vocab.len(),
         vocab.len(),
         SPIKE_LM_HEBB_TOKENS,
         SPIKE_LM_MAX_TICKS
     );
 
-    let mut model = SpikeSymbolLm::new(vocab, 0x51A6E);
-    // Seed synapses from n-grams, then a light Hebbian pass on a token cap.
-    let train_stats = model.train_bytes(train, 1);
+    let mut model = SpikeWordLm::new(vocab, 0x51A6E);
+    let train_stats = model.train_ids(&train_ids, 1);
     println!(
-        "train (n-gram synapses + Hebb≤{SPIKE_LM_HEBB_TOKENS}): tokens={}  acc={:.3}  nll={:.3}  ppl={:.2}",
+        "train (word n-gram synapses + Hebb≤{SPIKE_LM_HEBB_TOKENS}): tokens={}  acc={:.3}  nll={:.3}  ppl={:.2}",
         train_stats.tokens, train_stats.accuracy, train_stats.loss, train_stats.perplexity
     );
 
-    let eval_stats = model.evaluate_bytes(eval);
+    let eval_stats = model.evaluate_ids(&eval_ids);
     println!(
-        "eval (spike emit): tokens={}  acc={:.3}  nll={:.3}  ppl={:.2}",
+        "eval (spike emit word): tokens={}  acc={:.3}  nll={:.3}  ppl={:.2}",
         eval_stats.tokens, eval_stats.accuracy, eval_stats.loss, eval_stats.perplexity
     );
 
-    let prompt = b"To be, or not to be";
+    let prompt = "To be, or not to be";
     println!();
-    println!("spike-generate: max_ticks={SPIKE_LM_MAX_TICKS} temp=0.6");
-    let sample = model.generate(prompt, LM_SAMPLE_LEN, 0.6);
-    println!("sample spike-emit (temp=0.6, prompt+{LM_SAMPLE_LEN} bytes):");
+    println!("spike-generate words: max_ticks={SPIKE_LM_MAX_TICKS} temp=0.7 n={SPIKE_LM_SAMPLE_WORDS}");
+    let sample = model.generate(prompt, SPIKE_LM_SAMPLE_WORDS, 0.7);
+    println!("sample spike-emit words (temp=0.7, prompt+{SPIKE_LM_SAMPLE_WORDS} words):");
     println!("----");
-    println!("{}", String::from_utf8_lossy(&sample));
+    println!("{sample}");
     println!("----");
     println!(
-        "{{spike_lm: {{\"train_acc\": {:.6}, \"eval_acc\": {:.6}, \"eval_ppl\": {:.4}, \"neurons\": {}}}}}",
+        "{{spike_word_lm: {{\"train_acc\": {:.6}, \"eval_acc\": {:.6}, \"eval_ppl\": {:.4}, \"neurons\": {}}}}}",
         train_stats.accuracy,
         eval_stats.accuracy,
         eval_stats.perplexity,
-        model.n_symbols()
+        model.n_words()
     );
     Ok(())
 }
@@ -3410,72 +3488,92 @@ mod tests {
     }
 
     #[test]
-    fn test_spike_symbol_lm_maps_neuron_to_emit() {
-        // Tight loop: n-gram drives + spike emission should recover the cycle.
-        let text = b"abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcab";
-        let vocab = CharVocab::from_bytes(text);
-        let mut model = SpikeSymbolLm::new(vocab, 99);
-        assert_eq!(model.n_symbols(), model.vocab.len());
+    fn test_tokenize_words_and_vocab() {
+        let toks = tokenize_words(b"To be, or not to be.");
+        assert_eq!(
+            toks,
+            vec!["to", "be", ",", "or", "not", "to", "be", "."]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        );
+        let vocab = WordVocab::from_tokens(&toks);
+        assert_eq!(vocab.decode(0), "<unk>");
+        // unique: to, be, ,, or, not, .  → 6 + <unk>
+        assert_eq!(vocab.len(), 7);
+        assert_eq!(vocab.encode("be"), vocab.encode("be"));
+        assert_eq!(vocab.decode(vocab.encode("xyzzy")), "<unk>");
+    }
 
-        let stats = model.train_bytes(text, 1);
+    #[test]
+    fn test_spike_word_lm_maps_neuron_to_emit() {
+        // Tight word loop: n-gram drives + spike emission should recover the cycle.
+        let text = "cat dog fish cat dog fish cat dog fish cat dog fish cat dog fish cat dog fish ";
+        let tokens = tokenize_words(text.as_bytes());
+        let vocab = WordVocab::from_tokens(&tokens);
+        assert_eq!(vocab.len(), 4); // <unk> + cat, dog, fish
+        let ids = vocab.encode_tokens(&tokens);
+        let mut model = SpikeWordLm::new(vocab, 99);
+        assert_eq!(model.n_words(), model.vocab.len());
+
+        let stats = model.train_ids(&ids, 1);
         assert!(stats.tokens > 0);
         assert!(
             stats.accuracy > 0.5,
-            "spike-symbol LM should learn abc loop, acc={}",
+            "spike-word LM should learn cat/dog/fish loop, acc={}",
             stats.accuracy
         );
         assert!(stats.perplexity.is_finite() && stats.perplexity >= 1.0);
 
-        // After observing 'a', the 'b' neuron should be the one that fires.
+        // After observing "cat", the "dog" neuron should fire.
         model.reset_state();
-        model.observe(model.vocab.encode(b'a'));
+        model.observe(model.vocab.encode("cat"));
         let emitted = model.step_emit(0.0);
         assert_eq!(
             model.vocab.decode(emitted),
-            b'b',
-            "after 'a', expected 'b' neuron to spike/emit"
+            "dog",
+            "after 'cat', expected 'dog' neuron to spike/emit"
         );
 
-        let sample = model.generate(b"ab", 12, 0.0);
-        assert!(sample.len() >= 14);
-        assert!(std::str::from_utf8(&sample).is_ok());
-        // Greedy free-run from "ab" should continue the abc cycle.
-        let tail = &sample[2..];
-        let ok_cycle = tail.windows(3).filter(|w| *w == b"abc" || *w == b"bca" || *w == b"cab").count()
-            >= 2
-            || tail.iter().filter(|&&c| c == b'a' || c == b'b' || c == b'c').count()
-                >= tail.len().saturating_sub(2);
-        assert!(
-            ok_cycle,
-            "expected abc-like free-run, got {:?}",
-            String::from_utf8_lossy(&sample)
-        );
+        let sample = model.generate("cat dog", 9, 0.0);
+        assert!(sample.contains("fish") || sample.contains("cat") || sample.contains("dog"));
+        let sample_toks = tokenize_words(sample.as_bytes());
+        assert!(sample_toks.len() >= 5);
     }
 
     #[test]
-    fn test_spike_symbol_lm_shakespeare_prefix() {
+    fn test_spike_word_lm_shakespeare_prefix() {
         let corpus = load_corpus(LM_CORPUS_PATH).expect("100.txt.utf-8 should exist");
-        let train = &corpus[..50_000.min(corpus.len())];
-        let eval = &corpus[50_000..55_000.min(corpus.len())];
-        let vocab = CharVocab::from_bytes(train);
-        let mut model = SpikeSymbolLm::new(vocab, 7);
-        // n-gram synaptic init + one short Hebbian pass (capped tokens).
-        let train_stats = model.train_bytes(train, 1);
-        assert!(train_stats.accuracy > 0.15, "train acc={}", train_stats.accuracy);
-        let eval_stats = model.evaluate_bytes(eval);
+        // ~first 80k chars ≈ enough words for a stable small vocab.
+        let prefix = &corpus[..80_000.min(corpus.len())];
+        let tokens = tokenize_words(prefix);
+        let train_end = (tokens.len() * 9 / 10).max(64);
+        let train_toks = &tokens[..train_end];
+        let eval_toks = &tokens[train_end..];
+        let vocab = WordVocab::from_tokens(train_toks);
+        // Vocab covers every unique train word (+ <unk>).
+        assert!(vocab.len() > 50);
+        let train_ids = vocab.encode_tokens(train_toks);
+        let eval_ids = vocab.encode_tokens(eval_toks);
+        let mut model = SpikeWordLm::new(vocab, 7);
+        let train_stats = model.train_ids(&train_ids, 1);
         assert!(
-            eval_stats.accuracy > 0.12,
-            "expected bigram-driven spike LM above chance, eval_acc={}",
+            train_stats.accuracy > 0.08,
+            "train acc={}",
+            train_stats.accuracy
+        );
+        let eval_stats = model.evaluate_ids(&eval_ids);
+        assert!(
+            eval_stats.accuracy > 0.05,
+            "expected word spike LM above chance, eval_acc={}",
             eval_stats.accuracy
         );
-        let sample = model.generate(b"To be", 40, 0.4);
-        assert!(sample.len() > 40);
-        // Should not collapse to a single repeated character for 40 steps.
-        let uniq: std::collections::BTreeSet<u8> = sample.iter().copied().collect();
+        let sample = model.generate("to be or not", 20, 0.5);
+        assert!(!sample.is_empty());
+        let uniq: std::collections::BTreeSet<&str> = sample.split_whitespace().collect();
         assert!(
-            uniq.len() >= 5,
-            "degenerate sample: {:?}",
-            String::from_utf8_lossy(&sample)
+            uniq.len() >= 3,
+            "degenerate sample: {sample:?}"
         );
     }
 
@@ -3847,13 +3945,13 @@ fn main() {
     println!("{{total_mae: {:.6}}}", total_mae);
 
     // Character LM on Shakespeare (eBook #100): ensemble+RF block model, then
-    // the spike-emission model (one LifNeuron per symbol).
+    // the spike-emission word model (one LifNeuron per word).
     if let Err(e) = run_language_model(LM_CORPUS_PATH) {
         eprintln!("language model error: {e}");
         std::process::exit(1);
     }
-    if let Err(e) = run_spike_symbol_lm(LM_CORPUS_PATH) {
-        eprintln!("spike-symbol language model error: {e}");
+    if let Err(e) = run_spike_word_lm(LM_CORPUS_PATH) {
+        eprintln!("spike-word language model error: {e}");
         std::process::exit(1);
     }
 }

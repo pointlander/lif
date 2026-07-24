@@ -131,19 +131,29 @@ const ELITE_COUNT: usize = 4;
 /// Soft-update rates toward elite statistics (0 = freeze, 1 = hard replace).
 const LR_MEAN: f32 = 0.55;
 const LR_STD: f32 = 0.40;
-/// Keep exploration alive; clamp explosion.
-const STD_MIN: f32 = 0.05;
+/// Numerical floor only (not an exploration floor); std may shrink toward this.
+const STD_EPS: f32 = 1e-4;
+/// Upper clamp to avoid MC explosion.
 const STD_MAX: f32 = 2.0;
 /// Extra cost when a spike resets the membrane during tracking.
 const SPIKE_PENALTY: f32 = 0.2;
 /// Mild preference for small |v_rest| (steady-state V ≈ v_rest + I tracks I best at 0).
 const V_REST_L2: f32 = 0.01;
-/// Monte Carlo draws of (v_rest, v_threshold) per step (odd ⇒ no ties).
-const MC_SAMPLES: usize = 9;
+/// Monte Carlo draws of (v_rest, v_threshold) per step when noise is active (odd).
+const MC_SAMPLES: usize = 5;
+/// Below this search stddev, skip MC and use the trial means (fast path).
+const MC_DET_THRESH: f32 = 0.04;
 /// Fraction of search-dist stddev used as MC noise (keeps features stable).
-const MC_NOISE_SCALE: f32 = 0.3;
+const MC_NOISE_SCALE: f32 = 0.25;
 /// Initial CEM exploration scale (smaller ⇒ cleaner early tracking).
 const INIT_STD: f32 = 0.25;
+/// On spike, reset both search-dist stddevs to this value (re-opens exploration).
+const SPIKE_STD_RESET: f32 = 0.45;
+/// Sparse recurrent taps per ensemble unit.
+const REC_TAPS: usize = 4;
+
+/// Legacy alias used by a few tests that need a small positive stddev seed.
+const STD_MIN: f32 = 0.05;
 
 /// Hidden LIF units in the reservoir ensemble.
 const ENSEMBLE_N: usize = 48;
@@ -173,12 +183,18 @@ impl GaussianParam {
     pub fn new(mean: f32, stddev: f32) -> Self {
         Self {
             mean,
-            stddev: stddev.clamp(STD_MIN, STD_MAX),
+            // No exploration floor: only keep stddev positive and bounded above.
+            stddev: stddev.clamp(STD_EPS, STD_MAX),
         }
     }
 
     pub fn sample(&self, z: f32) -> f32 {
         self.mean + z * self.stddev
+    }
+
+    /// Set stddev (clamped to [STD_EPS, STD_MAX]).
+    pub fn set_stddev(&mut self, stddev: f32) {
+        self.stddev = stddev.clamp(STD_EPS, STD_MAX);
     }
 
     /// CEM soft update from rank-weighted elite samples.
@@ -206,12 +222,12 @@ impl GaussianParam {
 
         let old_mean = self.mean;
         self.mean = (1.0 - LR_MEAN) * self.mean + LR_MEAN * w_mean;
-        // Keep exploration alive while the mean is still traveling; pure elite
-        // variance collapses when the whole population sits in a bad cluster.
+        // Follow elite spread and mean travel; no minimum-std floor — exploration
+        // is restored on spike via [`SPIKE_STD_RESET`] instead.
         let travel = (self.mean - old_mean).abs();
-        let target_std = elite_std.max(travel).max(STD_MIN);
+        let target_std = elite_std.max(travel);
         self.stddev =
-            ((1.0 - LR_STD) * self.stddev + LR_STD * target_std).clamp(STD_MIN, STD_MAX);
+            ((1.0 - LR_STD) * self.stddev + LR_STD * target_std).clamp(STD_EPS, STD_MAX);
     }
 }
 
@@ -452,20 +468,14 @@ impl LifNeuron {
         self.step_with_target(i_input, i_input, dt)
     }
 
-    /// Monte Carlo LIF step under drive `drive`, score membrane vs `score_target`.
+    /// LIF step under drive `drive`, score membrane vs `score_target`.
     ///
-    /// Draws `MC_SAMPLES` independent parameter pairs from the search laws
-    /// centered on the CEM trial particle:
+    /// Uses a **deterministic** trial-mean update when both search stddevs are
+    /// below [`MC_DET_THRESH`]; otherwise Monte Carlo majority vote over
+    /// `MC_SAMPLES` draws from
+    /// `N(trial_*, v_*_dist.stddev * MC_NOISE_SCALE)`.
     ///
-    /// ```text
-    /// v_rest      ~ N(trial_v_rest,      v_rest_dist.stddev)
-    /// v_threshold ~ N(trial_v_threshold, v_threshold_dist.stddev)
-    /// ```
-    ///
-    /// For each draw, integrates one exact subthreshold step from the current
-    /// membrane, then:
-    /// - sets `v_membrane` to the mean of the sampled post-step voltages
-    /// - spikes only if a **strict majority** of those sampled steps would fire
+    /// On spike, stddevs reset to [`SPIKE_STD_RESET`].
     pub fn step_with_target(&mut self, drive: f32, score_target: f32, dt: f32) -> bool {
         // Refractory: hold at reset, still score so spikes that wreck the
         // trajectory are charged to the active trial parameters.
@@ -476,15 +486,35 @@ impl LifNeuron {
             return false;
         }
 
-        let (v_mean, spiked) = self.monte_carlo_step(drive, dt);
+        let (v_mean, spiked) = if self.v_rest_dist.stddev <= MC_DET_THRESH
+            && self.v_threshold_dist.stddev <= MC_DET_THRESH
+        {
+            self.deterministic_step(drive, dt)
+        } else {
+            self.monte_carlo_step(drive, dt)
+        };
         self.v_membrane = v_mean;
         if spiked {
             self.is_refractory = true;
             self.episode_spike_count += 1;
+            // Re-open parameter exploration after a spike (replaces a min-std floor).
+            self.v_rest_dist.set_stddev(SPIKE_STD_RESET);
+            self.v_threshold_dist.set_stddev(SPIKE_STD_RESET);
         }
 
         self.record_step(drive, score_target);
         spiked
+    }
+
+    /// Exact subthreshold step with fixed trial parameters (no MC).
+    #[inline]
+    fn deterministic_step(&self, drive: f32, dt: f32) -> (f32, bool) {
+        let decay = (-dt / self.tau_m.max(1e-3)).exp();
+        let v_rest = self.trial_v_rest;
+        let v_thr = self.trial_v_threshold.max(self.v_reset + 0.05);
+        let v_inf = v_rest + drive;
+        let v_new = v_inf + (self.v_membrane - v_inf) * decay;
+        (v_new, v_new >= v_thr)
     }
 
     /// Run `MC_SAMPLES` LIF micro-steps with params drawn from
@@ -495,26 +525,20 @@ impl LifNeuron {
         let decay = (-dt / self.tau_m.max(1e-3)).exp();
         let thr_floor = self.v_reset + 0.05;
 
-        // Episode law: CEM particle as mean; MC noise is a fraction of search std
-        // so membrane features stay smooth while firing stays probabilistic.
-        let rest_std = (self.v_rest_dist.stddev * MC_NOISE_SCALE).max(STD_MIN * 0.5);
-        let thr_std = (self.v_threshold_dist.stddev * MC_NOISE_SCALE).max(STD_MIN * 0.5);
-        let rest_law = GaussianParam {
-            mean: self.trial_v_rest,
-            stddev: rest_std,
-        };
-        let thr_law = GaussianParam {
-            mean: self.trial_v_threshold,
-            stddev: thr_std,
-        };
+        // Episode law: CEM particle as mean; MC noise is a fraction of search std.
+        // Stddevs may shrink freely; a spike resets them to SPIKE_STD_RESET.
+        let rest_std = (self.v_rest_dist.stddev * MC_NOISE_SCALE).max(STD_EPS);
+        let thr_std = (self.v_threshold_dist.stddev * MC_NOISE_SCALE).max(STD_EPS);
+        let rest_mean = self.trial_v_rest;
+        let thr_mean = self.trial_v_threshold;
 
         let mut fire_votes = 0usize;
         let mut v_sum = 0.0f32;
 
         for _ in 0..MC_SAMPLES {
             let (z_rest, z_thr) = self.rng.g();
-            let v_rest = rest_law.sample(z_rest);
-            let v_thr = thr_law.sample(z_thr).max(thr_floor);
+            let v_rest = rest_mean + z_rest * rest_std;
+            let v_thr = (thr_mean + z_thr * thr_std).max(thr_floor);
 
             // Exact subthreshold step: τ V' = -(V - v_rest) + I
             let v_inf = v_rest + drive;
@@ -546,8 +570,10 @@ pub struct LifEnsemble {
     pub units: Vec<LifNeuron>,
     /// w_in[h][d]: input dim d → hidden unit h.
     w_in: Vec<[f32; MAX_DIMS]>,
-    /// Sparse recurrent mix of previous membrane voltages.
-    w_rec: Vec<[f32; ENSEMBLE_N]>,
+    /// Sparse recurrent indices: unit h reads `prev_v[rec_idx[h][t]]`.
+    rec_idx: Vec<[usize; REC_TAPS]>,
+    /// Sparse recurrent weights aligned with `rec_idx`.
+    rec_w: Vec<[f32; REC_TAPS]>,
     /// Hidden readout: contribution of membrane V_h to output dim d.
     w_out: Vec<[f32; ENSEMBLE_N]>,
     /// Input skip: contribution of x_i to output dim d (critical for next-step).
@@ -574,7 +600,8 @@ impl LifEnsemble {
         let mut rng = Rand::new(seed.max(1));
         let mut units = Vec::with_capacity(ENSEMBLE_N);
         let mut w_in = Vec::with_capacity(ENSEMBLE_N);
-        let mut w_rec = Vec::with_capacity(ENSEMBLE_N);
+        let mut rec_idx = Vec::with_capacity(ENSEMBLE_N);
+        let mut rec_w = Vec::with_capacity(ENSEMBLE_N);
 
         // Diverse membrane time constants (exact integrator is stable for all τ).
         let taus = [3.0f32, 5.0, 7.0, 10.0, 12.0, 16.0, 22.0, 30.0];
@@ -608,26 +635,27 @@ impl LifEnsemble {
             }
             w_in.push(row_in);
 
-            let mut row_rec = [0.0f32; ENSEMBLE_N];
-            // Sparse recurrence (~4 taps per unit).
-            for _ in 0..4 {
-                let j = (rng.u32() as usize) % ENSEMBLE_N;
-                row_rec[j] += 0.4 * rng.signed();
+            let mut idx = [0usize; REC_TAPS];
+            let mut wts = [0.0f32; REC_TAPS];
+            for t in 0..REC_TAPS {
+                idx[t] = (rng.u32() as usize) % ENSEMBLE_N;
+                wts[t] = 0.4 * rng.signed();
             }
-            w_rec.push(row_rec);
+            rec_idx.push(idx);
+            rec_w.push(wts);
         }
 
-        // Rescale recurrence toward REC_RADIUS (row L1 proxy).
+        // Rescale sparse recurrence toward REC_RADIUS (row L1 proxy).
         let mut max_abs = 1e-6f32;
-        for row in &w_rec {
-            let s: f32 = row.iter().map(|w| w.abs()).sum();
+        for wts in &rec_w {
+            let s: f32 = wts.iter().map(|w| w.abs()).sum();
             if s > max_abs {
                 max_abs = s;
             }
         }
         let rec_scale = REC_RADIUS / max_abs;
-        for row in &mut w_rec {
-            for w in row.iter_mut() {
+        for wts in &mut rec_w {
+            for w in wts.iter_mut() {
                 *w *= rec_scale;
             }
         }
@@ -654,11 +682,10 @@ impl LifEnsemble {
             w_delay2.push([0.0; MAX_DIMS]);
         }
 
-        // Quiet MC noise in the reservoir so readout features are stable; CEM
-        // still adapts means via trial particles.
+        // Start quiet; stddevs re-open to SPIKE_STD_RESET when a unit spikes.
         for n in &mut units {
-            n.v_rest_dist.stddev = STD_MIN;
-            n.v_threshold_dist.stddev = STD_MIN;
+            n.v_rest_dist.set_stddev(STD_EPS);
+            n.v_threshold_dist.set_stddev(STD_EPS);
             n.trial_v_rest = n.v_rest_dist.mean;
             n.trial_v_threshold = n.v_threshold_dist.mean.max(n.v_reset + 0.1);
         }
@@ -666,7 +693,8 @@ impl LifEnsemble {
         Self {
             units,
             w_in,
-            w_rec,
+            rec_idx,
+            rec_w,
             w_out,
             w_skip,
             w_delay,
@@ -691,8 +719,10 @@ impl LifEnsemble {
             for d in 0..self.in_dims {
                 drive += self.w_in[h][d] * x[d];
             }
-            for j in 0..ENSEMBLE_N {
-                drive += self.w_rec[h][j] * self.prev_v[j];
+            let idx = &self.rec_idx[h];
+            let wts = &self.rec_w[h];
+            for t in 0..REC_TAPS {
+                drive += wts[t] * self.prev_v[idx[t]];
             }
             drives[h] = drive;
         }
@@ -918,7 +948,7 @@ const RF_THR_CANDIDATES: usize = 10;
 /// Generated sample length after training.
 const LM_SAMPLE_LEN: usize = 140;
 /// MCTS simulations per emitted character.
-const MCTS_SIMS: usize = 160;
+const MCTS_SIMS: usize = 96;
 /// PUCT exploration constant (slightly lower ⇒ trust value more).
 const MCTS_C_PUCT: f32 = 1.2;
 /// Expand only the top-k policy actions at each node.
@@ -2327,7 +2357,32 @@ mod tests {
         elite_rank_weights(3, &mut weights);
         p.update_from_elites(&elites, &weights);
         assert!(p.mean > 0.5); // pulled toward ~2
-        assert!(p.stddev >= STD_MIN);
+        assert!(p.stddev >= STD_EPS);
+        assert!(p.stddev <= STD_MAX);
+    }
+
+    #[test]
+    fn test_spike_resets_search_stddevs() {
+        let mut neuron = LifNeuron::new(0.0, 1.0, 0.0, 10.0);
+        neuron.trial_v_rest = 0.0;
+        neuron.trial_v_threshold = 1.0;
+        neuron.v_rest_dist.set_stddev(0.01);
+        neuron.v_threshold_dist.set_stddev(0.01);
+        neuron.v_membrane = 10.0;
+        neuron.pending_antithetic = None;
+        neuron.episode_step = 0;
+
+        assert!(neuron.step(0.0, 1.0), "expected spike from high membrane");
+        assert!(
+            (neuron.v_rest_dist.stddev - SPIKE_STD_RESET).abs() < 1e-5,
+            "v_rest stddev should reset on spike, got {}",
+            neuron.v_rest_dist.stddev
+        );
+        assert!(
+            (neuron.v_threshold_dist.stddev - SPIKE_STD_RESET).abs() < 1e-5,
+            "v_threshold stddev should reset on spike, got {}",
+            neuron.v_threshold_dist.stddev
+        );
     }
 
     #[test]

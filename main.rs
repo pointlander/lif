@@ -895,36 +895,36 @@ const LM_DT: f32 = 10.0;
 /// Dense char embedding size (must be ≤ [`MAX_DIMS`] for [`LifEnsemble`]).
 const LM_EMBED_DIMS: usize = MAX_DIMS;
 /// Sliding text block length (chars) over which the adjacency matrix is formed.
-const LM_BLOCK_SIZE: usize = 32;
+const LM_BLOCK_SIZE: usize = 24;
 /// Project ensemble membranes to this dim before forming the adjacency Gram
 /// (keeps RF feature size manageable: K(K+1)/2 + K).
-const LM_ADJ_PROJ: usize = 16;
+const LM_ADJ_PROJ: usize = 12;
 /// Default training path (Project Gutenberg Shakespeare, eBook #100).
 const LM_CORPUS_PATH: &str = "100.txt.utf-8";
 /// Characters used when streaming the reservoir for RF feature collection.
-const LM_TRAIN_CHARS: usize = 900_000;
+const LM_TRAIN_CHARS: usize = 700_000;
 /// Held-out window immediately after the train prefix.
-const LM_EVAL_CHARS: usize = 50_000;
+const LM_EVAL_CHARS: usize = 40_000;
 /// Max labeled pairs fed to the random forest (reservoir still sees full prefix).
-const RF_TRAIN_SAMPLES: usize = 80_000;
+const RF_TRAIN_SAMPLES: usize = 56_000;
 /// Number of trees in the readout forest.
-const RF_N_TREES: usize = 72;
+const RF_N_TREES: usize = 56;
 /// Max depth of each decision tree (shallower ⇒ less memorization of id noise).
-const RF_MAX_DEPTH: usize = 12;
+const RF_MAX_DEPTH: usize = 11;
 /// Minimum samples in a leaf (higher ⇒ smoother policy).
-const RF_MIN_LEAF: usize = 16;
+const RF_MIN_LEAF: usize = 18;
 /// Candidate thresholds tried per feature at each split.
-const RF_THR_CANDIDATES: usize = 16;
+const RF_THR_CANDIDATES: usize = 10;
 /// Generated sample length after training.
-const LM_SAMPLE_LEN: usize = 180;
+const LM_SAMPLE_LEN: usize = 140;
 /// MCTS simulations per emitted character.
-const MCTS_SIMS: usize = 96;
+const MCTS_SIMS: usize = 56;
 /// PUCT exploration constant (slightly lower ⇒ trust value more).
-const MCTS_C_PUCT: f32 = 1.15;
+const MCTS_C_PUCT: f32 = 1.2;
 /// Expand only the top-k policy actions at each node.
-const MCTS_TOP_K: usize = 18;
+const MCTS_TOP_K: usize = 14;
 /// Stochastic rollout length (chars) after expansion (short ⇒ less noise).
-const MCTS_ROLLOUT: usize = 3;
+const MCTS_ROLLOUT: usize = 2;
 /// Blend weights for shaped policy: RF + bigram + unigram (should sum to 1).
 /// Bigram dominates — character LMs live or die by local co-occurrence.
 const MCTS_RF_BLEND: f32 = 0.18;
@@ -1126,52 +1126,56 @@ impl RandomForest {
             .max(1)
             .min(self.n_features.max(1));
 
+        // Shared scratch to cut per-split allocations across the forest.
+        let mut scratch = RfScratch::new(n_classes, self.n_features, n);
+
         for _ in 0..n_trees {
-            // Bootstrap sample indices.
-            let mut boot = vec![0usize; n];
-            for b in &mut boot {
-                *b = (rng.u32() as usize) % n;
+            scratch.boot.clear();
+            for _ in 0..n {
+                scratch.boot.push((rng.u32() as usize) % n);
             }
-            let tree = build_tree(x, y, &boot, n_classes, mtry, 0, rng);
+            // Detach bootstrap indices so `scratch` can be mutably borrowed for splits.
+            let boot = core::mem::take(&mut scratch.boot);
+            let tree = build_tree(x, y, &boot, n_classes, mtry, rng, &mut scratch);
+            scratch.boot = boot;
             self.trees.push(tree);
         }
     }
 
     /// Soft vote: average leaf class histograms → probabilities.
     pub fn predict_proba(&self, x: &[f32]) -> Vec<f32> {
-        let mut acc = vec![0.0f32; self.n_classes.max(1)];
+        let nc = self.n_classes.max(1);
+        let mut acc = vec![0.0f32; nc];
         if self.trees.is_empty() {
-            let u = 1.0 / acc.len() as f32;
+            let u = 1.0 / nc as f32;
             for p in &mut acc {
                 *p = u;
             }
             return acc;
         }
+        let inv_t = 1.0 / self.trees.len() as f32;
         for tree in &self.trees {
             let hist = tree.predict_hist(x);
             let mut tot = 0u32;
             for &c in hist {
-                tot += c;
+                tot = tot.wrapping_add(c);
             }
-            let inv = 1.0 / tot.max(1) as f32;
-            for (i, &c) in hist.iter().enumerate() {
-                acc[i] += c as f32 * inv;
+            let inv = inv_t / tot.max(1) as f32;
+            let n = hist.len().min(nc);
+            for i in 0..n {
+                acc[i] += hist[i] as f32 * inv;
             }
-        }
-        let inv_t = 1.0 / self.trees.len() as f32;
-        for p in &mut acc {
-            *p *= inv_t;
         }
         // Laplace smooth so NLL stays finite on rare classes.
-        let k = acc.len() as f32;
-        let eps = 1e-4;
+        let eps = 1e-4 / nc as f32;
         let mut s = 0.0f32;
         for p in &mut acc {
-            *p = *p + eps / k;
+            *p += eps;
             s += *p;
         }
+        let inv_s = 1.0 / s.max(1e-12);
         for p in &mut acc {
-            *p /= s;
+            *p *= inv_s;
         }
         acc
     }
@@ -1194,15 +1198,41 @@ fn argmax_f32(v: &[f32]) -> usize {
     best_i
 }
 
-fn class_hist(y: &[usize], idx: &[usize], n_classes: usize) -> Vec<u32> {
-    let mut h = vec![0u32; n_classes];
+struct RfScratch {
+    boot: Vec<usize>,
+    feat_order: Vec<usize>,
+    left_hist: Vec<u32>,
+    right_hist: Vec<u32>,
+    parent_hist: Vec<u32>,
+    left_idx: Vec<usize>,
+    right_idx: Vec<usize>,
+}
+
+impl RfScratch {
+    fn new(n_classes: usize, n_features: usize, n_samples: usize) -> Self {
+        Self {
+            boot: Vec::with_capacity(n_samples),
+            feat_order: (0..n_features).collect(),
+            left_hist: vec![0; n_classes],
+            right_hist: vec![0; n_classes],
+            parent_hist: vec![0; n_classes],
+            left_idx: Vec::with_capacity(n_samples),
+            right_idx: Vec::with_capacity(n_samples),
+        }
+    }
+}
+
+fn fill_hist(y: &[usize], idx: &[usize], n_classes: usize, out: &mut [u32]) -> u32 {
+    out.fill(0);
+    let mut total = 0u32;
     for &i in idx {
         let c = y[i];
         if c < n_classes {
-            h[c] += 1;
+            out[c] += 1;
+            total += 1;
         }
     }
-    h
+    total
 }
 
 fn gini(hist: &[u32], total: u32) -> f32 {
@@ -1218,29 +1248,17 @@ fn gini(hist: &[u32], total: u32) -> f32 {
     1.0 - s
 }
 
-fn majority_class(hist: &[u32]) -> usize {
-    let mut best_i = 0;
-    let mut best = 0u32;
-    for (i, &c) in hist.iter().enumerate() {
-        if c > best {
-            best = c;
-            best_i = i;
-        }
-    }
-    best_i
-}
-
 fn build_tree(
     x: &[Vec<f32>],
     y: &[usize],
     idx: &[usize],
     n_classes: usize,
     mtry: usize,
-    depth: usize,
     rng: &mut Rand,
+    scratch: &mut RfScratch,
 ) -> DecisionTree {
     let mut nodes = Vec::new();
-    build_node(x, y, idx, n_classes, mtry, depth, rng, &mut nodes);
+    build_node(x, y, idx, n_classes, mtry, 0, rng, &mut nodes, scratch);
     DecisionTree { nodes }
 }
 
@@ -1253,10 +1271,10 @@ fn build_node(
     depth: usize,
     rng: &mut Rand,
     nodes: &mut Vec<RfNode>,
+    scratch: &mut RfScratch,
 ) -> usize {
-    let hist = class_hist(y, idx, n_classes);
-    let total: u32 = hist.iter().sum();
-    let pure = hist.iter().filter(|&&c| c > 0).count() <= 1;
+    let total = fill_hist(y, idx, n_classes, &mut scratch.parent_hist);
+    let pure = scratch.parent_hist.iter().filter(|&&c| c > 0).count() <= 1;
     let stop = pure
         || depth >= RF_MAX_DEPTH
         || idx.len() <= RF_MIN_LEAF
@@ -1269,7 +1287,7 @@ fn build_node(
         threshold: 0.0,
         left: 0,
         right: 0,
-        hist: hist.clone(),
+        hist: scratch.parent_hist.clone(),
     });
 
     if stop || x.is_empty() {
@@ -1277,66 +1295,82 @@ fn build_node(
     }
 
     let n_features = x[0].len();
-    // Random feature subset.
-    let mut feat_order: Vec<usize> = (0..n_features).collect();
-    // Partial Fisher–Yates for first mtry features.
     let m = mtry.min(n_features);
+    // Partial Fisher–Yates into feat_order[0..m].
+    if scratch.feat_order.len() != n_features {
+        scratch.feat_order = (0..n_features).collect();
+    }
     for i in 0..m {
         let j = i + (rng.u32() as usize) % (n_features - i);
-        feat_order.swap(i, j);
+        scratch.feat_order.swap(i, j);
     }
 
-    let parent_gini = gini(&hist, total);
+    let parent_gini = gini(&scratch.parent_hist, total);
     let mut best_gain = 0.0f32;
     let mut best_feat = 0usize;
     let mut best_thr = 0.0f32;
-    let mut best_left: Vec<usize> = Vec::new();
-    let mut best_right: Vec<usize> = Vec::new();
 
-    for &f in feat_order.iter().take(m) {
-        // Random threshold candidates from data values.
+    for fi in 0..m {
+        let f = scratch.feat_order[fi];
         for _ in 0..RF_THR_CANDIDATES {
             let s = idx[(rng.u32() as usize) % idx.len()];
             let thr = x[s][f];
-            let mut left = Vec::new();
-            let mut right = Vec::new();
-            left.reserve(idx.len() / 2);
-            right.reserve(idx.len() / 2);
+            // Count-only pass (no index materialization until a split wins).
+            scratch.left_hist.fill(0);
+            let mut lt = 0u32;
+            let mut rt = 0u32;
             for &i in idx {
+                let c = y[i];
                 if x[i][f] <= thr {
-                    left.push(i);
-                } else {
-                    right.push(i);
+                    if c < n_classes {
+                        scratch.left_hist[c] += 1;
+                        lt += 1;
+                    }
+                } else if c < n_classes {
+                    rt += 1;
                 }
             }
-            if left.len() < RF_MIN_LEAF || right.len() < RF_MIN_LEAF {
+            if (lt as usize) < RF_MIN_LEAF || (rt as usize) < RF_MIN_LEAF {
                 continue;
             }
-            let lh = class_hist(y, &left, n_classes);
-            let rh = class_hist(y, &right, n_classes);
-            let lt: u32 = lh.iter().sum();
-            let rt: u32 = rh.iter().sum();
+            // right_hist = parent - left
+            for c in 0..n_classes {
+                scratch.right_hist[c] = scratch.parent_hist[c].saturating_sub(scratch.left_hist[c]);
+            }
             let gain = parent_gini
-                - (lt as f32 / total as f32) * gini(&lh, lt)
-                - (rt as f32 / total as f32) * gini(&rh, rt);
+                - (lt as f32 / total as f32) * gini(&scratch.left_hist, lt)
+                - (rt as f32 / total as f32) * gini(&scratch.right_hist, rt);
             if gain > best_gain {
                 best_gain = gain;
                 best_feat = f;
                 best_thr = thr;
-                best_left = left;
-                best_right = right;
             }
         }
     }
 
-    if best_gain <= 1e-8 || best_left.is_empty() || best_right.is_empty() {
-        // Keep as leaf (already stored).
-        let _ = majority_class(&hist);
+    if best_gain <= 1e-8 {
         return me;
     }
 
-    let left_i = build_node(x, y, &best_left, n_classes, mtry, depth + 1, rng, nodes);
-    let right_i = build_node(x, y, &best_right, n_classes, mtry, depth + 1, rng, nodes);
+    // Materialize best split indices once.
+    scratch.left_idx.clear();
+    scratch.right_idx.clear();
+    for &i in idx {
+        if x[i][best_feat] <= best_thr {
+            scratch.left_idx.push(i);
+        } else {
+            scratch.right_idx.push(i);
+        }
+    }
+    if scratch.left_idx.len() < RF_MIN_LEAF || scratch.right_idx.len() < RF_MIN_LEAF {
+        return me;
+    }
+
+    // Clone index sets for recursion (scratch buffers reused deeper).
+    let left_idx = scratch.left_idx.clone();
+    let right_idx = scratch.right_idx.clone();
+    let left_i = build_node(x, y, &left_idx, n_classes, mtry, depth + 1, rng, nodes, scratch);
+    let right_i = build_node(x, y, &right_idx, n_classes, mtry, depth + 1, rng, nodes, scratch);
     nodes[me] = RfNode {
         is_leaf: false,
         feature: best_feat,
@@ -1363,6 +1397,8 @@ pub struct LifLanguageModel {
     recent: Vec<usize>,
     /// Ring buffer of the last [`LM_BLOCK_SIZE`] **projected** membrane vectors.
     v_block: Vec<[f32; LM_ADJ_PROJ]>,
+    /// Running sum of outer products \(S = \sum_t z_t z_t^\top\) (row-major K×K).
+    gram_sum: [f32; LM_ADJ_PROJ * LM_ADJ_PROJ],
     /// Fixed random projection ENSEMBLE_N → LM_ADJ_PROJ for adjacency features.
     adj_proj: [[f32; ENSEMBLE_N]; LM_ADJ_PROJ],
     /// Number of valid entries currently in `v_block` (≤ LM_BLOCK_SIZE).
@@ -1418,6 +1454,7 @@ impl LifLanguageModel {
             prev2_id: 0,
             recent: Vec::new(),
             v_block: vec![[0.0; LM_ADJ_PROJ]; LM_BLOCK_SIZE],
+            gram_sum: [0.0; LM_ADJ_PROJ * LM_ADJ_PROJ],
             adj_proj,
             v_block_len: 0,
             v_block_pos: 0,
@@ -1442,18 +1479,37 @@ impl LifLanguageModel {
         self.recent.iter().filter(|&&c| c == id).count()
     }
 
-    /// Project full membrane state → [`LM_ADJ_PROJ`] and store in the block ring.
+    #[inline]
+    fn gram_add_outer(gram: &mut [f32; LM_ADJ_PROJ * LM_ADJ_PROJ], z: &[f32; LM_ADJ_PROJ], sign: f32) {
+        let k = LM_ADJ_PROJ;
+        for i in 0..k {
+            let zi = z[i] * sign;
+            let row = i * k;
+            for j in 0..k {
+                gram[row + j] += zi * z[j];
+            }
+        }
+    }
+
+    /// Project membranes → K-D, update ring + **incremental** Gram sum \(S\).
     fn record_block_state(&mut self) {
         let h = self.ensemble.hidden_state();
         let mut z = [0.0f32; LM_ADJ_PROJ];
         let n = h.len().min(ENSEMBLE_N);
         for k in 0..LM_ADJ_PROJ {
             let mut s = 0.0f32;
+            let row = &self.adj_proj[k];
             for j in 0..n {
-                s += self.adj_proj[k][j] * h[j];
+                s += row[j] * h[j];
             }
             z[k] = s;
         }
+        // Sliding window: remove the vector we're about to overwrite.
+        if self.v_block_len == LM_BLOCK_SIZE {
+            let old = self.v_block[self.v_block_pos];
+            Self::gram_add_outer(&mut self.gram_sum, &old, -1.0);
+        }
+        Self::gram_add_outer(&mut self.gram_sum, &z, 1.0);
         self.v_block[self.v_block_pos] = z;
         self.v_block_pos = (self.v_block_pos + 1) % LM_BLOCK_SIZE;
         if self.v_block_len < LM_BLOCK_SIZE {
@@ -1461,57 +1517,30 @@ impl LifLanguageModel {
         }
     }
 
-    /// Projected unit co-activation adjacency over the current text block.
+    /// Adjacency embedding from the running Gram \(A = S / T\).
     ///
-    /// For projected membrane trajectories \(z_t \in \mathbb{R}^{K}\) in the block:
-    /// \(A_{ij} = \frac{1}{T}\sum_t z_t[i]\, z_t[j]\). Embedding = upper triangle
-    /// (incl. diagonal) + row-sum degrees, L2-normalized.
+    /// Packs upper triangle (incl. diagonal) + row-sum degrees, L2-normalized.
+    /// O(K²) — does **not** rescan the block.
     fn adjacency_embedding(&self) -> Vec<f32> {
         let k = LM_ADJ_PROJ;
-        let mut a = vec![0.0f32; k * k];
+        let tri = k * (k + 1) / 2;
         if self.v_block_len == 0 {
-            let tri = k * (k + 1) / 2;
             return vec![0.0; tri + k];
         }
-
-        let start = if self.v_block_len < LM_BLOCK_SIZE {
-            0
-        } else {
-            self.v_block_pos
-        };
-        for t in 0..self.v_block_len {
-            let idx = (start + t) % LM_BLOCK_SIZE;
-            let z = &self.v_block[idx];
-            for i in 0..k {
-                let zi = z[i];
-                let row = i * k;
-                for j in 0..k {
-                    a[row + j] += zi * z[j];
+        let inv_t = 1.0 / self.v_block_len as f32;
+        let mut emb = Vec::with_capacity(tri + k);
+        let mut deg = [0.0f32; LM_ADJ_PROJ];
+        for i in 0..k {
+            let row = i * k;
+            let mut d = 0.0f32;
+            for j in 0..k {
+                let aij = self.gram_sum[row + j] * inv_t;
+                d += aij.abs();
+                if j >= i {
+                    emb.push(aij);
                 }
             }
-        }
-
-        let inv_t = 1.0 / self.v_block_len as f32;
-        for x in &mut a {
-            *x *= inv_t;
-        }
-
-        let mut deg = vec![0.0f32; k];
-        for i in 0..k {
-            let mut s = 0.0f32;
-            let row = i * k;
-            for j in 0..k {
-                s += a[row + j].abs();
-            }
-            deg[i] = s;
-        }
-
-        let mut emb = Vec::with_capacity(k * (k + 1) / 2 + k);
-        for i in 0..k {
-            let row = i * k;
-            for j in i..k {
-                emb.push(a[row + j]);
-            }
+            deg[i] = d;
         }
         emb.extend_from_slice(&deg);
 
@@ -1520,8 +1549,9 @@ impl LifLanguageModel {
             nrm += x * x;
         }
         nrm = nrm.sqrt().max(1e-6);
+        let inv_n = 1.0 / nrm;
         for x in &mut emb {
-            *x /= nrm;
+            *x *= inv_n;
         }
         emb
     }
@@ -1709,6 +1739,7 @@ impl LifLanguageModel {
         self.recent.clear();
         self.v_block_len = 0;
         self.v_block_pos = 0;
+        self.gram_sum = [0.0; LM_ADJ_PROJ * LM_ADJ_PROJ];
         for row in &mut self.v_block {
             *row = [0.0; LM_ADJ_PROJ];
         }
@@ -1721,6 +1752,7 @@ impl LifLanguageModel {
             prev2_id: self.prev2_id,
             recent: self.recent.clone(),
             v_block: self.v_block.clone(),
+            gram_sum: self.gram_sum,
             v_block_len: self.v_block_len,
             v_block_pos: self.v_block_pos,
             rng_lfsr: self.rng.lfsr,
@@ -1731,8 +1763,9 @@ impl LifLanguageModel {
         self.ensemble.restore_dynamics(&snap.ensemble);
         self.prev_id = snap.prev_id;
         self.prev2_id = snap.prev2_id;
-        self.recent = snap.recent.clone();
-        self.v_block = snap.v_block.clone();
+        self.recent.clone_from(&snap.recent);
+        self.v_block.clone_from(&snap.v_block);
+        self.gram_sum = snap.gram_sum;
         self.v_block_len = snap.v_block_len;
         self.v_block_pos = snap.v_block_pos;
         self.rng.lfsr = snap.rng_lfsr;
@@ -2049,21 +2082,28 @@ impl LifLanguageModel {
         self.forest
             .fit(&xs, &ys, n_classes, RF_N_TREES, &mut self.rng);
 
+        // Cheap in-bag estimate on a stride of fit rows (full scan is O(trees·N·d)).
         let mut hits = 0u64;
         let mut nll_sum = 0.0f64;
-        for (x, &y) in xs.iter().zip(ys.iter()) {
+        let mut scored = 0u64;
+        let score_stride = (xs.len() / 4096).max(1);
+        for (i, (x, &y)) in xs.iter().zip(ys.iter()).enumerate() {
+            if i % score_stride != 0 {
+                continue;
+            }
             let p = self.forest.predict_proba(x);
             if argmax_f32(&p) == y {
                 hits += 1;
             }
             nll_sum += -p[y].max(1e-12).ln() as f64;
+            scored += 1;
         }
-        let n = xs.len().max(1) as f64;
+        let n = scored.max(1) as f64;
         let mean_nll = (nll_sum / n) as f32;
         LmTrainStats {
             tokens: xs.len(),
             loss: mean_nll,
-            accuracy: hits as f32 / xs.len().max(1) as f32,
+            accuracy: hits as f32 / scored.max(1) as f32,
             perplexity: mean_nll.exp(),
         }
     }
@@ -2136,6 +2176,7 @@ struct LmDynamicsSnap {
     prev2_id: usize,
     recent: Vec<usize>,
     v_block: Vec<[f32; LM_ADJ_PROJ]>,
+    gram_sum: [f32; LM_ADJ_PROJ * LM_ADJ_PROJ],
     v_block_len: usize,
     v_block_pos: usize,
     rng_lfsr: u32,

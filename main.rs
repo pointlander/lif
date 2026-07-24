@@ -918,7 +918,7 @@ const RF_THR_CANDIDATES: usize = 10;
 /// Generated sample length after training.
 const LM_SAMPLE_LEN: usize = 140;
 /// MCTS simulations per emitted character.
-const MCTS_SIMS: usize = 56;
+const MCTS_SIMS: usize = 160;
 /// PUCT exploration constant (slightly lower ⇒ trust value more).
 const MCTS_C_PUCT: f32 = 1.2;
 /// Expand only the top-k policy actions at each node.

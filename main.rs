@@ -917,6 +917,115 @@ impl Rand {
 }
 
 // ---------------------------------------------------------------------------
+// Lightweight suffix array (generation-buffer dedup for MCTS)
+// ---------------------------------------------------------------------------
+
+/// Sorted suffix starts for a short byte string (generation context is small).
+#[derive(Clone, Debug)]
+struct LightSuffixArray {
+    text: Vec<u8>,
+    /// `sa[r]` = start index of the r-th suffix in lexicographic order.
+    sa: Vec<usize>,
+}
+
+impl LightSuffixArray {
+    fn build(text: Vec<u8>) -> Self {
+        let n = text.len();
+        let mut sa: Vec<usize> = (0..n).collect();
+        // O(n² log n) compare — fine for prompt+sample lengths (hundreds of bytes).
+        sa.sort_by(|&i, &j| text[i..].cmp(&text[j..]));
+        Self { text, sa }
+    }
+
+    /// True if `pat` occurs as a substring of `text` (via SA lower-bound).
+    fn contains(&self, pat: &[u8]) -> bool {
+        if pat.is_empty() {
+            return true;
+        }
+        if pat.len() > self.text.len() || self.sa.is_empty() {
+            return false;
+        }
+        // Lower-bound binary search on suffixes, then scan the matching range.
+        let mut lo = 0usize;
+        let mut hi = self.sa.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let suf = &self.text[self.sa[mid]..];
+            if suf < pat {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        // All suffixes that could start with `pat` are contiguous in SA order.
+        let mut i = lo;
+        while i < self.sa.len() {
+            let suf = &self.text[self.sa[i]..];
+            if !suf.starts_with(&pat[..1.min(pat.len())]) && suf > pat {
+                break;
+            }
+            if suf.starts_with(pat) {
+                return true;
+            }
+            // Stop once we've left the pat-prefix block.
+            if pat.len() <= suf.len() && suf[..pat.len()] > *pat {
+                break;
+            }
+            i += 1;
+        }
+        // Fallback: correct for any residual SA-order edge cases (n is small).
+        self.text.windows(pat.len()).any(|w| w == pat)
+    }
+
+    /// Longest \(L \ge\) [`SA_DEDUP_MIN_LEN`] such that the length-\(L\) ending of
+    /// `text ++ [c]` already occurs as a substring starting earlier in `text`.
+    /// Returns 0 if no such repeat exists.
+    fn duplicate_extension_len(&self, c: u8) -> usize {
+        let n = self.text.len();
+        if n < SA_DEDUP_MIN_LEN.saturating_sub(1) {
+            return 0;
+        }
+        let max_l = (n + 1).min(SA_DEDUP_MAX_LEN);
+        for l in (SA_DEDUP_MIN_LEN..=max_l).rev() {
+            // Ending pattern: last (l-1) bytes of text, then c.
+            let take = l - 1;
+            if take > n {
+                continue;
+            }
+            let mut pat = Vec::with_capacity(l);
+            pat.extend_from_slice(&self.text[n - take..n]);
+            pat.push(c);
+            // Occurrence must lie entirely in the old text (start ≤ n-l).
+            // Searching `pat` in `text` is sufficient: a match of length l cannot
+            // use the new byte except as the terminal occurrence itself.
+            if self.contains(&pat) {
+                return l;
+            }
+        }
+        0
+    }
+
+    /// Same check without a prebuilt SA (for short path extensions inside MCTS).
+    fn duplicate_extension_len_raw(text: &[u8], path: &[u8], c: u8) -> usize {
+        let mut s = Vec::with_capacity(text.len() + path.len() + 1);
+        s.extend_from_slice(text);
+        s.extend_from_slice(path);
+        s.push(c);
+        let n = s.len();
+        let max_l = n.min(SA_DEDUP_MAX_LEN);
+        for l in (SA_DEDUP_MIN_LEN..=max_l).rev() {
+            let start = n - l;
+            let needle = &s[start..];
+            // Search needle in s[0..start]
+            if start >= l && s[..start].windows(l).any(|w| w == needle) {
+                return l;
+            }
+        }
+        0
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Character-level natural language model (LifEnsemble + random-forest readout)
 // ---------------------------------------------------------------------------
 
@@ -960,16 +1069,20 @@ const MCTS_ROLLOUT: usize = 2;
 const MCTS_RF_BLEND: f32 = 0.18;
 const MCTS_BIGRAM_BLEND: f32 = 0.70;
 const MCTS_UNIGRAM_BLEND: f32 = 0.12;
-/// Multiplicative penalty on P(same char as last) unless a legal double letter.
-const MCTS_REPEAT_PRIOR: f32 = 0.55;
-/// Extra value penalty (nats) for illegal stutter.
-const MCTS_REPEAT_VALUE: f32 = 1.75;
 /// Floor probability mass reserved for non-top-k (keeps priors honest).
 const MCTS_PRIOR_FLOOR: f32 = 1e-4;
 /// Softmax temperature applied to the shaped policy before MCTS/top-k (<1 sharpens).
 const MCTS_POLICY_TEMP: f32 = 0.7;
 /// Weight of immediate action log-prob vs deeper path in the backup value.
 const MCTS_IMMEDIATE_WEIGHT: f32 = 0.65;
+/// Min repeated-suffix length that triggers SA dedup (phrase-level, not single chars).
+const SA_DEDUP_MIN_LEN: usize = 4;
+/// Max pattern length checked when testing a one-byte extension.
+const SA_DEDUP_MAX_LEN: usize = 24;
+/// Multiplicative prior scale per extra repeated byte beyond [`SA_DEDUP_MIN_LEN`].
+const SA_DEDUP_PRIOR_SCALE: f32 = 0.35;
+/// Extra MCTS value penalty (nats) when an action creates a long exact repeat.
+const SA_DEDUP_VALUE_PENALTY: f32 = 2.0;
 
 /// Keep printable ASCII + newline (maps curly quotes etc. away upstream).
 fn is_lm_byte(b: u8) -> bool {
@@ -1423,8 +1536,6 @@ pub struct LifLanguageModel {
     embed: Vec<[f32; MAX_DIMS]>,
     prev_id: usize,
     prev2_id: usize,
-    /// Sliding window of recent char ids (diversity shaping during generation).
-    recent: Vec<usize>,
     /// Ring buffer of the last [`LM_BLOCK_SIZE`] **projected** membrane vectors.
     v_block: Vec<[f32; LM_ADJ_PROJ]>,
     /// Running sum of outer products \(S = \sum_t z_t z_t^\top\) (row-major K×K).
@@ -1482,7 +1593,6 @@ impl LifLanguageModel {
             embed,
             prev_id: 0,
             prev2_id: 0,
-            recent: Vec::new(),
             v_block: vec![[0.0; LM_ADJ_PROJ]; LM_BLOCK_SIZE],
             gram_sum: [0.0; LM_ADJ_PROJ * LM_ADJ_PROJ],
             adj_proj,
@@ -1493,20 +1603,6 @@ impl LifLanguageModel {
             forest: RandomForest::new(),
             rng,
         }
-    }
-
-    const RECENT_WINDOW: usize = 28;
-
-    fn push_recent(&mut self, id: usize) {
-        self.recent.push(id);
-        if self.recent.len() > Self::RECENT_WINDOW {
-            let drop = self.recent.len() - Self::RECENT_WINDOW;
-            self.recent.drain(0..drop);
-        }
-    }
-
-    fn recent_count(&self, id: usize) -> usize {
-        self.recent.iter().filter(|&&c| c == id).count()
     }
 
     #[inline]
@@ -1586,16 +1682,6 @@ impl LifLanguageModel {
         emb
     }
 
-    /// Letters that commonly double in English (allow weak self-transition).
-    fn is_doubleable(b: u8) -> bool {
-        matches!(
-            b,
-            b'e' | b'l' | b's' | b'o' | b't' | b'f' | b'p' | b'r' | b'n' | b'm' | b'c' | b'd'
-                | b'E' | b'L' | b'S' | b'O' | b'T' | b'F' | b'P' | b'R' | b'N' | b'M' | b'C'
-                | b'D'
-        )
-    }
-
     /// Linguistic / byte-shape features (ordered better than raw vocab ids for trees).
     fn push_char_meta(f: &mut Vec<f32>, b: u8) {
         f.push(if b.is_ascii_lowercase() { 1.0 } else { 0.0 });
@@ -1654,8 +1740,16 @@ impl LifLanguageModel {
         f
     }
 
-    /// Shape RF probabilities for search: RF + bigram + unigram + anti-repetition.
-    fn shape_policy(&self, rf: Vec<f32>, last_char: usize) -> Vec<f32> {
+    /// Shape RF probabilities for search: RF + bigram + unigram, then SA dedup.
+    ///
+    /// When `sa` is `Some`, candidates that would extend a long exact repeat of
+    /// the generation buffer are multiplicatively down-weighted.
+    fn shape_policy(
+        &self,
+        rf: Vec<f32>,
+        last_char: usize,
+        sa: Option<&LightSuffixArray>,
+    ) -> Vec<f32> {
         let n = rf.len();
         if n == 0 {
             return rf;
@@ -1673,85 +1767,31 @@ impl LifLanguageModel {
             let r = rf.get(i).copied().unwrap_or(u);
             p[i] = MCTS_RF_BLEND * r + MCTS_BIGRAM_BLEND * bi + MCTS_UNIGRAM_BLEND * u;
         }
-        let last_b = self.vocab.decode(last_char);
-        if last_char < n {
-            let allow = Self::is_doubleable(last_b) || last_b == b' ' || last_b == b'\n';
-            if !allow {
-                p[last_char] *= 1.0 - MCTS_REPEAT_PRIOR;
-            } else {
-                p[last_char] *= 1.0 - 0.15 * MCTS_REPEAT_PRIOR;
-            }
-        }
-        // Break short cycles: ... x y x  and  ... x y z x
-        if self.prev_id < n {
-            p[self.prev_id] *= 0.40;
-        }
-        if self.prev2_id < n {
-            p[self.prev2_id] *= 0.55;
-        }
-        // Diversity: downweight chars over-used in the recent window.
-        for i in 0..n {
-            let c = self.recent_count(i);
-            if c > 0 {
-                p[i] *= 1.0 / (1.0 + 0.85 * c as f32);
-            }
-        }
-        // Soft ban of control-ish bytes that are not space/newline.
-        for i in 0..n {
-            let b = self.vocab.decode(i);
-            if b < 32 && b != b'\n' {
-                p[i] *= 0.02;
-            }
-            // Discourage ALL-CAPS runs that dominate Shakespeare stage directions.
-            if b.is_ascii_uppercase() && last_b.is_ascii_uppercase() {
-                p[i] *= 0.45;
-            }
-            // Prefer space after sentence punctuation.
-            if matches!(last_b, b'.' | b'!' | b'?' | b':' | b';') && b == b' ' {
-                p[i] *= 1.8;
-            }
-            // Prefer letter after space (start of word).
-            if last_b == b' ' && b.is_ascii_alphabetic() {
-                p[i] *= 1.35;
-            }
-            // Prefer lowercase continuation after lowercase (word body).
-            if last_b.is_ascii_lowercase() && b.is_ascii_lowercase() {
-                p[i] *= 1.15;
-            }
-        }
-        // After finishing "the ", strongly downweight restarting "the".
-        if last_b == b' ' {
-            let p1 = self.vocab.decode(self.prev_id);
-            let p2 = self.vocab.decode(self.prev2_id);
-            if p2 == b'h' && p1 == b'e' {
-                for i in 0..n {
-                    if self.vocab.decode(i) == b't' {
-                        p[i] *= 0.15;
-                    }
-                }
-            }
-            // Same for "and ", "an ".
-            if (p2 == b'n' && p1 == b'd') || (p2 == b'a' && p1 == b'n') {
-                for i in 0..n {
-                    let b = self.vocab.decode(i);
-                    if b == b'a' || b == b't' {
-                        p[i] *= 0.35;
-                    }
+
+        // Suffix-array phrase dedup on one-byte extensions of the buffer.
+        if let Some(sa) = sa {
+            for i in 0..n {
+                let b = self.vocab.decode(i);
+                let rep = sa.duplicate_extension_len(b);
+                if rep >= SA_DEDUP_MIN_LEN {
+                    let extra = (rep - SA_DEDUP_MIN_LEN + 1) as f32;
+                    p[i] *= SA_DEDUP_PRIOR_SCALE.powf(extra);
                 }
             }
         }
+
         // Temperature sharpening of the mixture prior.
         let inv_t = 1.0 / MCTS_POLICY_TEMP.max(1e-3);
-        let mut max = f32::NEG_INFINITY;
+        let mut maxv = f32::NEG_INFINITY;
         for &x in &p {
             let z = x.max(1e-12).ln() * inv_t;
-            if z > max {
-                max = z;
+            if z > maxv {
+                maxv = z;
             }
         }
         let mut s = 0.0f32;
         for x in &mut p {
-            *x = ((*x).max(1e-12).ln() * inv_t - max).exp();
+            *x = ((*x).max(1e-12).ln() * inv_t - maxv).exp();
             s += *x;
         }
         if s > 0.0 {
@@ -1766,7 +1806,6 @@ impl LifLanguageModel {
         self.ensemble.reset_dynamics();
         self.prev_id = 0;
         self.prev2_id = 0;
-        self.recent.clear();
         self.v_block_len = 0;
         self.v_block_pos = 0;
         self.gram_sum = [0.0; LM_ADJ_PROJ * LM_ADJ_PROJ];
@@ -1780,7 +1819,6 @@ impl LifLanguageModel {
             ensemble: self.ensemble.snapshot_dynamics(),
             prev_id: self.prev_id,
             prev2_id: self.prev2_id,
-            recent: self.recent.clone(),
             v_block: self.v_block.clone(),
             gram_sum: self.gram_sum,
             v_block_len: self.v_block_len,
@@ -1793,7 +1831,6 @@ impl LifLanguageModel {
         self.ensemble.restore_dynamics(&snap.ensemble);
         self.prev_id = snap.prev_id;
         self.prev2_id = snap.prev2_id;
-        self.recent.clone_from(&snap.recent);
         self.v_block.clone_from(&snap.v_block);
         self.gram_sum = snap.gram_sum;
         self.v_block_len = snap.v_block_len;
@@ -1811,9 +1848,13 @@ impl LifLanguageModel {
         }
     }
 
-    /// Search policy: RF + n-gram blend + anti-repetition / diversity shaping.
-    fn policy_from_features(&self, char_id: usize) -> Vec<f32> {
-        self.shape_policy(self.rf_policy(char_id), char_id)
+    /// Search policy: RF + n-gram blend, optionally SA-deduped against `sa`.
+    fn policy_from_features(
+        &self,
+        char_id: usize,
+        sa: Option<&LightSuffixArray>,
+    ) -> Vec<f32> {
+        self.shape_policy(self.rf_policy(char_id), char_id, sa)
     }
 
     /// Drive ensemble on `char_id`, return **raw** RF probs (for eval).
@@ -1822,17 +1863,20 @@ impl LifLanguageModel {
         let probs = self.rf_policy(char_id);
         self.prev2_id = self.prev_id;
         self.prev_id = char_id;
-        self.push_recent(char_id);
         probs
     }
 
     /// Like [`observe`] but returns the shaped search policy (generation / MCTS).
-    fn observe_search(&mut self, char_id: usize) -> Vec<f32> {
+    /// `sa` is the suffix array of the committed generation buffer for dedup.
+    fn observe_search(
+        &mut self,
+        char_id: usize,
+        sa: Option<&LightSuffixArray>,
+    ) -> Vec<f32> {
         self.drive_char(char_id, None);
-        let probs = self.policy_from_features(char_id);
+        let probs = self.policy_from_features(char_id, sa);
         self.prev2_id = self.prev_id;
         self.prev_id = char_id;
-        self.push_recent(char_id);
         probs
     }
 
@@ -1884,13 +1928,20 @@ impl LifLanguageModel {
         idx
     }
 
-    /// Choose next char with Monte Carlo Tree Search (PUCT + RF policy prior).
+    /// Choose next char with MCTS (PUCT + RF/n-gram prior + **suffix-array dedup**).
     ///
-    /// Value = mean log-probability along the path + rollout (higher is better).
-    /// Only the top-[`MCTS_TOP_K`] policy actions are expanded at each node.
-    fn mcts_select_action(&mut self, last_char: usize, temperature: f32) -> usize {
+    /// `gen_text` is the committed generation buffer (prompt + emitted so far).
+    /// Actions that would complete a repeated substring of length ≥
+    /// [`SA_DEDUP_MIN_LEN`] are down-weighted in the prior and value.
+    fn mcts_select_action(
+        &mut self,
+        last_char: usize,
+        temperature: f32,
+        gen_text: &[u8],
+    ) -> usize {
         let root_snap = self.snapshot_lm();
-        let root_prior = self.policy_from_features(last_char);
+        let sa = LightSuffixArray::build(gen_text.to_vec());
+        let root_prior = self.policy_from_features(last_char, Some(&sa));
         let root_actions = Self::top_k_actions(&root_prior, MCTS_TOP_K);
 
         let mut nodes: Vec<MctsNode> = vec![MctsNode {
@@ -1911,6 +1962,7 @@ impl LifLanguageModel {
             let mut node = 0usize;
             let mut path_logp = 0.0f32;
             let mut cur_char = last_char;
+            let mut path_bytes: Vec<u8> = Vec::new();
 
             // Selection: PUCT among fully expanded interiors.
             while nodes[node].unexpanded.is_empty() && !nodes[node].children.is_empty() {
@@ -1928,13 +1980,17 @@ impl LifLanguageModel {
                     }
                 }
                 let act = nodes[best_child].action;
-                let probs = self.policy_from_features(cur_char);
+                let probs = self.policy_from_features(cur_char, Some(&sa));
                 let mut lp = probs.get(act).copied().unwrap_or(1e-12).max(1e-12).ln();
-                if act == cur_char && !Self::is_doubleable(self.vocab.decode(cur_char)) {
-                    lp -= MCTS_REPEAT_VALUE;
+                let b = self.vocab.decode(act);
+                let rep = LightSuffixArray::duplicate_extension_len_raw(gen_text, &path_bytes, b);
+                if rep >= SA_DEDUP_MIN_LEN {
+                    lp -= SA_DEDUP_VALUE_PENALTY
+                        * (rep - SA_DEDUP_MIN_LEN + 1) as f32;
                 }
                 path_logp += lp;
-                let _ = self.observe_search(act);
+                let _ = self.observe_search(act, Some(&sa));
+                path_bytes.push(b);
                 cur_char = act;
                 path.push(best_child);
                 node = best_child;
@@ -1952,20 +2008,27 @@ impl LifLanguageModel {
                     }
                 }
                 let (act, prior) = nodes[node].unexpanded.swap_remove(pick);
-                let probs = self.policy_from_features(cur_char);
+                let probs = self.policy_from_features(cur_char, Some(&sa));
                 let mut lp = probs.get(act).copied().unwrap_or(1e-12).max(1e-12).ln();
-                if act == cur_char && !Self::is_doubleable(self.vocab.decode(cur_char)) {
-                    lp -= MCTS_REPEAT_VALUE;
+                let b = self.vocab.decode(act);
+                let rep = LightSuffixArray::duplicate_extension_len_raw(gen_text, &path_bytes, b);
+                if rep >= SA_DEDUP_MIN_LEN {
+                    lp -= SA_DEDUP_VALUE_PENALTY
+                        * (rep - SA_DEDUP_MIN_LEN + 1) as f32;
                 }
-                // Remember immediate log-prob for root-child value emphasis.
                 if path.len() == 1 {
                     first_step_lp = lp;
                 }
                 path_logp += lp;
-                let _ = self.observe_search(act);
+                let _ = self.observe_search(act, Some(&sa));
+                path_bytes.push(b);
                 cur_char = act;
 
-                let child_prior = self.policy_from_features(cur_char);
+                // Deeper priors: rebuild SA on gen_text+path for accurate dedup.
+                let mut ext = gen_text.to_vec();
+                ext.extend_from_slice(&path_bytes);
+                let sa_ext = LightSuffixArray::build(ext);
+                let child_prior = self.policy_from_features(cur_char, Some(&sa_ext));
                 let child_actions = Self::top_k_actions(&child_prior, MCTS_TOP_K);
                 let child = nodes.len();
                 nodes.push(MctsNode {
@@ -1983,25 +2046,28 @@ impl LifLanguageModel {
                 path.push(child);
             }
 
-            // Short rollout (mild temperature; shaped policy).
+            // Short rollout.
             let mut rollout_logp = 0.0f32;
             let mut rc = cur_char;
             let roll_temp = temperature.clamp(0.5, 0.75);
             for _ in 0..MCTS_ROLLOUT {
-                let probs = self.policy_from_features(rc);
+                let probs = self.policy_from_features(rc, Some(&sa));
                 let a = self.sample_from_probs(&probs, roll_temp);
                 let mut lp = probs.get(a).copied().unwrap_or(1e-12).max(1e-12).ln();
-                if a == rc && !Self::is_doubleable(self.vocab.decode(rc)) {
-                    lp -= MCTS_REPEAT_VALUE;
+                let b = self.vocab.decode(a);
+                let rep = LightSuffixArray::duplicate_extension_len_raw(gen_text, &path_bytes, b);
+                if rep >= SA_DEDUP_MIN_LEN {
+                    lp -= SA_DEDUP_VALUE_PENALTY
+                        * (rep - SA_DEDUP_MIN_LEN + 1) as f32;
                 }
                 rollout_logp += lp;
-                let _ = self.observe_search(a);
+                let _ = self.observe_search(a, Some(&sa));
+                path_bytes.push(b);
                 rc = a;
             }
 
             let deep_steps = (path.len().saturating_sub(1) + MCTS_ROLLOUT).max(1) as f32;
             let deep = (path_logp + rollout_logp) / deep_steps;
-            // Emphasize the first chosen action's quality (what we actually emit).
             let value = if first_step_lp != 0.0 {
                 MCTS_IMMEDIATE_WEIGHT * first_step_lp
                     + (1.0 - MCTS_IMMEDIATE_WEIGHT) * deep
@@ -2020,7 +2086,6 @@ impl LifLanguageModel {
         if nodes[0].children.is_empty() {
             return argmax_f32(&root_prior);
         }
-        // Prefer high visit count; break ties with Q and prior.
         let mut best_a = nodes[nodes[0].children[0]].action;
         let mut best_score = f32::NEG_INFINITY;
         for &ch in &nodes[0].children {
@@ -2105,7 +2170,6 @@ impl LifLanguageModel {
             }
             self.prev2_id = self.prev_id;
             self.prev_id = a;
-            self.push_recent(a);
         }
 
         let n_classes = self.vocab.len();
@@ -2171,11 +2235,11 @@ impl LifLanguageModel {
         }
     }
 
-    /// Generate `n` bytes after `prompt` with **Monte Carlo Tree Search**.
+    /// Generate `n` bytes after `prompt` with **MCTS + suffix-array dedup**.
     ///
-    /// For each character, runs [`MCTS_SIMS`] simulations with PUCT selection,
-    /// RF policy priors, and stochastic rollouts. `temperature` controls rollout
-    /// sampling only; the emitted token is the root child with most visits.
+    /// For each character, runs [`MCTS_SIMS`] simulations with PUCT selection.
+    /// A lightweight suffix array of the committed buffer down-weights actions
+    /// that would complete a long exact repeat. `temperature` controls rollouts.
     pub fn generate(&mut self, prompt: &[u8], n: usize, temperature: f32) -> Vec<u8> {
         self.reset_state();
 
@@ -2183,19 +2247,23 @@ impl LifLanguageModel {
         if out.is_empty() {
             out.push(b' ');
         }
+        // Prime dynamics on the prompt (no SA yet — buffer is the prompt itself).
+        let sa_prompt = LightSuffixArray::build(out.clone());
         for &b in &out {
-            let _ = self.observe_search(self.vocab.encode(b));
+            let _ = self.observe_search(self.vocab.encode(b), Some(&sa_prompt));
         }
         let mut last = self.vocab.encode(*out.last().unwrap());
 
         for _ in 0..n {
-            let next = self.mcts_select_action(last, temperature);
+            let next = self.mcts_select_action(last, temperature, &out);
             out.push(self.vocab.decode(next));
-            let _ = self.observe_search(next);
+            let sa = LightSuffixArray::build(out.clone());
+            let _ = self.observe_search(next, Some(&sa));
             last = next;
         }
         out
     }
+
 }
 
 /// LM dynamics snapshot for MCTS (ensemble + block adjacency buffer + RNG).
@@ -2204,7 +2272,6 @@ struct LmDynamicsSnap {
     ensemble: EnsembleDynamicsSnap,
     prev_id: usize,
     prev2_id: usize,
-    recent: Vec<usize>,
     v_block: Vec<[f32; LM_ADJ_PROJ]>,
     gram_sum: [f32; LM_ADJ_PROJ * LM_ADJ_PROJ],
     v_block_len: usize,
@@ -2732,6 +2799,29 @@ mod tests {
             correct as f32 / xs.len() as f32 > 0.85,
             "RF should separate simple blobs, acc={}",
             correct as f32 / xs.len() as f32
+        );
+    }
+
+    #[test]
+    fn test_suffix_array_detects_duplicate_extension() {
+        // "hello hell" + 'o' completes "hello", already present at the start.
+        let sa = LightSuffixArray::build(b"hello hell".to_vec());
+        assert!(sa.contains(b"hello"));
+        assert!(sa.contains(b"hell"));
+        let rep = sa.duplicate_extension_len(b'o');
+        assert!(
+            rep >= SA_DEDUP_MIN_LEN,
+            "expected long duplicate extension for 'o', got {rep}"
+        );
+        // Novel continuation should not flag a long repeat.
+        let rep_z = sa.duplicate_extension_len(b'z');
+        assert_eq!(rep_z, 0, "novel byte should not form a long prior substring");
+
+        // text="hello ", path="hel", c='l' → "... hell" with "hell" already in text.
+        let raw = LightSuffixArray::duplicate_extension_len_raw(b"hello ", b"hel", b'l');
+        assert!(
+            raw >= SA_DEDUP_MIN_LEN,
+            "path-aware raw check should see 'hell' repeating, got {raw}"
         );
     }
 

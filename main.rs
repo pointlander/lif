@@ -1307,7 +1307,10 @@ impl WordVocab {
     }
 }
 
-/// Split corpus bytes into lowercase word tokens (alphanumeric + apostrophe).
+/// Split corpus bytes into word tokens (alphanumeric + apostrophe).
+///
+/// **Case is preserved**: `"The"` and `"the"` are distinct tokens (and thus
+/// distinct vocab ids / LifNeurons when both appear).
 ///
 /// Punctuation (`. , ! ? ; :`) is emitted as its own one-character token
 /// (so `be.` → `["be", "."]`).
@@ -1317,7 +1320,7 @@ pub fn tokenize_words(data: &[u8]) -> Vec<String> {
     let mut cur = String::new();
     for ch in s.chars() {
         if ch.is_ascii_alphanumeric() || ch == '\'' {
-            cur.push(ch.to_ascii_lowercase());
+            cur.push(ch);
         } else {
             if !cur.is_empty() {
                 words.push(std::mem::take(&mut cur));
@@ -3892,7 +3895,7 @@ mod tests {
         let toks = tokenize_words(b"To be, or not to be.");
         assert_eq!(
             toks,
-            vec!["to", "be", ",", "or", "not", "to", "be", "."]
+            vec!["To", "be", ",", "or", "not", "to", "be", "."]
                 .into_iter()
                 .map(String::from)
                 .collect::<Vec<_>>()
@@ -3903,12 +3906,13 @@ mod tests {
 
         let vocab = WordVocab::from_tokens(&toks);
         assert_eq!(vocab.decode(0), "<unk>");
-        // unique: to, be, ,, or, not, . → 6 + <unk>
-        assert_eq!(vocab.len(), 7);
+        // unique: To, be, ,, or, not, to, . → 7 + <unk> (case-sensitive)
+        assert_eq!(vocab.len(), 8);
+        assert_ne!(vocab.encode("To"), vocab.encode("to"));
         assert_eq!(vocab.encode("be"), vocab.encode("be"));
         assert_eq!(vocab.decode(vocab.encode(".")), ".");
         assert_eq!(vocab.decode(vocab.encode("xyzzy")), "<unk>");
-        assert_eq!(join_word_tokens(&toks), "to be, or not to be.");
+        assert_eq!(join_word_tokens(&toks), "To be, or not to be.");
     }
 
     #[test]

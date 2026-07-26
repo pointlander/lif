@@ -256,51 +256,107 @@ fn elite_rank_weights(elite_n: usize, out: &mut [f32]) {
     }
 }
 
-// Define the Leaky Integrate-and-Fire neuron
+// ---------------------------------------------------------------------------
+// Simple leaky integrate-and-fire neuron (deterministic, no CEM)
+// ---------------------------------------------------------------------------
+
+/// Minimal LIF cell: exact subthreshold Euler-free step, one-step refractory.
+///
+/// Dynamics: \(\tau \dot V = -(V - v_{\mathrm{rest}}) + I\). Spike when
+/// \(V \ge v_{\mathrm{threshold}}\), then hold at \(v_{\mathrm{reset}}\) for one step.
+/// Used directly by [`SpikeWordLm`]; CEM/MC adaptation lives in [`CemLifNeuron`].
+#[derive(Clone, Debug)]
 pub struct LifNeuron {
     pub v_membrane: f32,
+    pub v_rest: f32,
+    pub v_threshold: f32,
     pub v_reset: f32,
     pub tau_m: f32,
     pub is_refractory: bool,
-
-    /// Search distribution over resting potential. Per-step Monte Carlo draws
-    /// `v_rest ~ N(trial_v_rest, v_rest_dist.stddev)` (CEM particle × learned scale).
-    pub v_rest_dist: GaussianParam,
-    /// Search distribution over spike threshold. Paired with `v_rest_dist` in the
-    /// per-step Monte Carlo: fire only if a majority of sampled LIF steps spike.
-    pub v_threshold_dist: GaussianParam,
-
-    /// Parameters active for the current episode.
-    pub trial_v_rest: f32,
-    pub trial_v_threshold: f32,
-    /// Antithetic partner for the next episode (reduces gradient noise).
-    pending_antithetic: Option<(f32, f32)>,
-
-    /// Per-step I/O history (for inspection / scoring).
-    pub input: RingBuffer<f32, POP_SIZE>,
-    pub output: RingBuffer<f32, POP_SIZE>,
-    /// Completed-episode fitness population for CEM.
-    pub episode_fitness: RingBuffer<f32, POP_SIZE>,
-    pub episode_v_rest: RingBuffer<f32, POP_SIZE>,
-    pub episode_v_threshold: RingBuffer<f32, POP_SIZE>,
-
-    /// Accumulators for the open episode.
-    episode_error_sum: f32,
-    episode_spike_count: u32,
-    episode_step: u32,
-    pub generation: u64,
-    /// Last generation's mean episode fitness (for monitoring).
-    pub last_gen_fitness: f32,
-    pub rng: Rand,
 }
 
 impl LifNeuron {
     pub fn new(v_rest: f32, v_threshold: f32, v_reset: f32, tau_m: f32) -> Self {
-        let mut neuron = Self {
+        Self {
             v_membrane: v_rest,
+            v_rest,
+            v_threshold,
             v_reset,
             tau_m,
             is_refractory: false,
+        }
+    }
+
+    /// Place membrane at rest and clear refractory.
+    pub fn reset(&mut self) {
+        self.v_membrane = self.v_rest;
+        self.is_refractory = false;
+    }
+
+    /// One deterministic LIF update. Returns `true` if the neuron spiked.
+    pub fn step(&mut self, drive: f32, dt: f32) -> bool {
+        if self.is_refractory {
+            self.is_refractory = false;
+            self.v_membrane = self.v_reset;
+            return false;
+        }
+        let decay = (-dt / self.tau_m.max(1e-3)).exp();
+        let thr = self.v_threshold.max(self.v_reset + 0.05);
+        let v_inf = self.v_rest + drive;
+        let v_new = v_inf + (self.v_membrane - v_inf) * decay;
+        self.v_membrane = v_new;
+        if v_new >= thr {
+            self.is_refractory = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Exact subthreshold step with explicit rest/threshold (used by CEM trials).
+    #[inline]
+    pub fn integrate(v0: f32, drive: f32, v_rest: f32, v_threshold: f32, v_reset: f32, tau_m: f32, dt: f32) -> (f32, bool) {
+        let decay = (-dt / tau_m.max(1e-3)).exp();
+        let thr = v_threshold.max(v_reset + 0.05);
+        let v_inf = v_rest + drive;
+        let v_new = v_inf + (v0 - v_inf) * decay;
+        (v_new, v_new >= thr)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CEM + Monte Carlo adaptive LIF (ensemble / benchmarks)
+// ---------------------------------------------------------------------------
+
+/// Adaptive LIF: wraps a [`LifNeuron`] with CEM search over `(v_rest, v_threshold)`
+/// and optional Monte Carlo majority-vote firing.
+pub struct CemLifNeuron {
+    pub cell: LifNeuron,
+    /// Search distribution over resting potential.
+    pub v_rest_dist: GaussianParam,
+    /// Search distribution over spike threshold.
+    pub v_threshold_dist: GaussianParam,
+    /// Parameters active for the current episode.
+    pub trial_v_rest: f32,
+    pub trial_v_threshold: f32,
+    pending_antithetic: Option<(f32, f32)>,
+    pub input: RingBuffer<f32, POP_SIZE>,
+    pub output: RingBuffer<f32, POP_SIZE>,
+    pub episode_fitness: RingBuffer<f32, POP_SIZE>,
+    pub episode_v_rest: RingBuffer<f32, POP_SIZE>,
+    pub episode_v_threshold: RingBuffer<f32, POP_SIZE>,
+    episode_error_sum: f32,
+    episode_spike_count: u32,
+    episode_step: u32,
+    pub generation: u64,
+    pub last_gen_fitness: f32,
+    pub rng: Rand,
+}
+
+impl CemLifNeuron {
+    pub fn new(v_rest: f32, v_threshold: f32, v_reset: f32, tau_m: f32) -> Self {
+        let mut neuron = Self {
+            cell: LifNeuron::new(v_rest, v_threshold, v_reset, tau_m),
             v_rest_dist: GaussianParam::new(v_rest, INIT_STD),
             v_threshold_dist: GaussianParam::new(v_threshold, INIT_STD),
             trial_v_rest: v_rest,
@@ -322,6 +378,18 @@ impl LifNeuron {
         neuron
     }
 
+    pub fn v_membrane(&self) -> f32 {
+        self.cell.v_membrane
+    }
+
+    pub fn is_refractory(&self) -> bool {
+        self.cell.is_refractory
+    }
+
+    pub fn v_reset(&self) -> f32 {
+        self.cell.v_reset
+    }
+
     pub fn v_rest(&self) -> f32 {
         self.v_rest_dist.mean
     }
@@ -338,28 +406,26 @@ impl LifNeuron {
         self.v_threshold_dist.stddev
     }
 
-    /// Start a new episode: antithetic pair if available, else fresh Gaussian sample.
-    fn resample_trial(&mut self) {
+    pub fn resample_trial(&mut self) {
         if let Some((rest, thr)) = self.pending_antithetic.take() {
             self.trial_v_rest = rest;
             self.trial_v_threshold = thr;
             return;
         }
-
         let (z0, z1) = self.rng.g();
         self.trial_v_rest = self.v_rest_dist.sample(z0);
-        self.trial_v_threshold = self.v_threshold_dist.sample(z1).max(self.v_reset + 0.05);
-
-        // Antithetic twin mirrors the noise for the following episode.
+        self.trial_v_threshold = self
+            .v_threshold_dist
+            .sample(z1)
+            .max(self.cell.v_reset + 0.05);
         self.pending_antithetic = Some((
             self.v_rest_dist.sample(-z0),
             self.v_threshold_dist
                 .sample(-z1)
-                .max(self.v_reset + 0.05),
+                .max(self.cell.v_reset + 0.05),
         ));
     }
 
-    /// Episode cost: mean squared tracking error + spike disruption + mild prior.
     fn episode_fitness_value(&self) -> f32 {
         let steps = self.episode_step.max(1) as f32;
         let mse = self.episode_error_sum / steps;
@@ -373,31 +439,24 @@ impl LifNeuron {
         self.episode_fitness.push(fitness);
         self.episode_v_rest.push(self.trial_v_rest);
         self.episode_v_threshold.push(self.trial_v_threshold);
-
         self.episode_error_sum = 0.0;
         self.episode_spike_count = 0;
         self.episode_step = 0;
-
         if self.episode_fitness.len() >= POP_SIZE {
             self.cem_update();
         }
-
         self.resample_trial();
     }
 
-    /// Cross-entropy method with log-rank elite weights and soft Gaussian updates.
-    fn cem_update(&mut self) {
+    pub fn cem_update(&mut self) {
         let n = self.episode_fitness.len();
         if n == 0 {
             return;
         }
-
         let mut order = [0usize; POP_SIZE];
         for i in 0..n {
             order[i] = i;
         }
-
-        // Sort ascending: lower fitness is better.
         let mut swapped = true;
         while swapped {
             swapped = false;
@@ -416,11 +475,9 @@ impl LifNeuron {
                 }
             }
         }
-
         let elite_n = ELITE_COUNT.min(n).max(1);
         let mut weights = [0.0f32; POP_SIZE];
         elite_rank_weights(elite_n, &mut weights);
-
         let mut elite_rest = [0.0f32; POP_SIZE];
         let mut elite_thr = [0.0f32; POP_SIZE];
         for i in 0..elite_n {
@@ -428,60 +485,42 @@ impl LifNeuron {
             elite_rest[i] = *self.episode_v_rest.get(idx).unwrap_or(&0.0);
             elite_thr[i] = *self.episode_v_threshold.get(idx).unwrap_or(&0.0);
         }
-
         self.v_rest_dist
             .update_from_elites(&elite_rest[..elite_n], &weights[..elite_n]);
         self.v_threshold_dist
             .update_from_elites(&elite_thr[..elite_n], &weights[..elite_n]);
-        // Keep threshold above reset so the neuron can still spike when useful.
-        if self.v_threshold_dist.mean < self.v_reset + 0.1 {
-            self.v_threshold_dist.mean = self.v_reset + 0.1;
+        if self.v_threshold_dist.mean < self.cell.v_reset + 0.1 {
+            self.v_threshold_dist.mean = self.cell.v_reset + 0.1;
         }
-
-        // Monitor: average fitness of the whole generation.
         self.last_gen_fitness = self.episode_fitness.sum() / n as f32;
         self.generation += 1;
-
-        // Fresh population next generation.
         self.episode_fitness.clear();
         self.episode_v_rest.clear();
         self.episode_v_threshold.clear();
-        // Drop a pending antithetic that was drawn under the old distribution.
         self.pending_antithetic = None;
     }
 
-    /// Score membrane against `score_target` (may differ from the drive current).
     fn record_step(&mut self, drive: f32, score_target: f32) {
-        let err = score_target - self.v_membrane;
+        let err = score_target - self.cell.v_membrane;
         self.episode_error_sum += err * err;
         self.episode_step += 1;
         self.input.push(drive);
-        self.output.push(self.v_membrane);
-
+        self.output.push(self.cell.v_membrane);
         if self.episode_step >= EPISODE_LEN as u32 {
             self.finish_episode();
         }
     }
 
-    /// Drive with `i_input` and score tracking of the same value.
     pub fn step(&mut self, i_input: f32, dt: f32) -> bool {
         self.step_with_target(i_input, i_input, dt)
     }
 
-    /// LIF step under drive `drive`, score membrane vs `score_target`.
-    ///
-    /// Uses a **deterministic** trial-mean update when both search stddevs are
-    /// below [`MC_DET_THRESH`]; otherwise Monte Carlo majority vote over
-    /// `MC_SAMPLES` draws from
-    /// `N(trial_*, v_*_dist.stddev * MC_NOISE_SCALE)`.
-    ///
-    /// On spike, stddevs reset to [`SPIKE_STD_RESET`].
+    /// LIF step with CEM trial params; MC majority vote when search noise is high.
+    /// On spike, search stddevs reset to [`SPIKE_STD_RESET`].
     pub fn step_with_target(&mut self, drive: f32, score_target: f32, dt: f32) -> bool {
-        // Refractory: hold at reset, still score so spikes that wreck the
-        // trajectory are charged to the active trial parameters.
-        if self.is_refractory {
-            self.is_refractory = false;
-            self.v_membrane = self.v_reset;
+        if self.cell.is_refractory {
+            self.cell.is_refractory = false;
+            self.cell.v_membrane = self.cell.v_reset;
             self.record_step(drive, score_target);
             return false;
         }
@@ -489,66 +528,56 @@ impl LifNeuron {
         let (v_mean, spiked) = if self.v_rest_dist.stddev <= MC_DET_THRESH
             && self.v_threshold_dist.stddev <= MC_DET_THRESH
         {
-            self.deterministic_step(drive, dt)
+            LifNeuron::integrate(
+                self.cell.v_membrane,
+                drive,
+                self.trial_v_rest,
+                self.trial_v_threshold,
+                self.cell.v_reset,
+                self.cell.tau_m,
+                dt,
+            )
         } else {
             self.monte_carlo_step(drive, dt)
         };
-        self.v_membrane = v_mean;
+        self.cell.v_membrane = v_mean;
         if spiked {
-            self.is_refractory = true;
+            self.cell.is_refractory = true;
             self.episode_spike_count += 1;
-            // Re-open parameter exploration after a spike (replaces a min-std floor).
             self.v_rest_dist.set_stddev(SPIKE_STD_RESET);
             self.v_threshold_dist.set_stddev(SPIKE_STD_RESET);
         }
-
         self.record_step(drive, score_target);
         spiked
     }
 
-    /// Exact subthreshold step with fixed trial parameters (no MC).
-    #[inline]
-    fn deterministic_step(&self, drive: f32, dt: f32) -> (f32, bool) {
-        let decay = (-dt / self.tau_m.max(1e-3)).exp();
-        let v_rest = self.trial_v_rest;
-        let v_thr = self.trial_v_threshold.max(self.v_reset + 0.05);
-        let v_inf = v_rest + drive;
-        let v_new = v_inf + (self.v_membrane - v_inf) * decay;
-        (v_new, v_new >= v_thr)
-    }
-
-    /// Run `MC_SAMPLES` LIF micro-steps with params drawn from
-    /// `v_rest_dist` / `v_threshold_dist` (trial mean, scaled learned stddev).
-    /// Returns `(mean_post_voltage, majority_fired)`.
-    fn monte_carlo_step(&mut self, drive: f32, dt: f32) -> (f32, bool) {
-        let v0 = self.v_membrane;
-        let decay = (-dt / self.tau_m.max(1e-3)).exp();
-        let thr_floor = self.v_reset + 0.05;
-
-        // Episode law: CEM particle as mean; MC noise is a fraction of search std.
-        // Stddevs may shrink freely; a spike resets them to SPIKE_STD_RESET.
+    pub fn monte_carlo_step(&mut self, drive: f32, dt: f32) -> (f32, bool) {
+        let v0 = self.cell.v_membrane;
+        let thr_floor = self.cell.v_reset + 0.05;
         let rest_std = (self.v_rest_dist.stddev * MC_NOISE_SCALE).max(STD_EPS);
         let thr_std = (self.v_threshold_dist.stddev * MC_NOISE_SCALE).max(STD_EPS);
         let rest_mean = self.trial_v_rest;
         let thr_mean = self.trial_v_threshold;
-
         let mut fire_votes = 0usize;
         let mut v_sum = 0.0f32;
-
         for _ in 0..MC_SAMPLES {
             let (z_rest, z_thr) = self.rng.g();
             let v_rest = rest_mean + z_rest * rest_std;
             let v_thr = (thr_mean + z_thr * thr_std).max(thr_floor);
-
-            // Exact subthreshold step: τ V' = -(V - v_rest) + I
-            let v_inf = v_rest + drive;
-            let v_new = v_inf + (v0 - v_inf) * decay;
+            let (v_new, fired) = LifNeuron::integrate(
+                v0,
+                drive,
+                v_rest,
+                v_thr,
+                self.cell.v_reset,
+                self.cell.tau_m,
+                dt,
+            );
             v_sum += v_new;
-            if v_new >= v_thr {
+            if fired {
                 fire_votes += 1;
             }
         }
-
         let v_mean = v_sum / MC_SAMPLES as f32;
         let spiked = fire_votes * 2 > MC_SAMPLES;
         (v_mean, spiked)
@@ -567,7 +596,7 @@ impl LifNeuron {
 /// so linear next-step maps (rotation, one-hot permutation) are learnable
 /// even when the reservoir is a pure encoder of the current input.
 pub struct LifEnsemble {
-    pub units: Vec<LifNeuron>,
+    pub units: Vec<CemLifNeuron>,
     /// w_in[h][d]: input dim d → hidden unit h.
     w_in: Vec<[f32; MAX_DIMS]>,
     /// Sparse recurrent indices: unit h reads `prev_v[rec_idx[h][t]]`.
@@ -612,7 +641,7 @@ impl LifEnsemble {
             // Slightly different seeds / inits so CEM populations diverge.
             let v_rest0 = 0.35 * rng.signed();
             let thr0 = 2.0 + 1.0 * rng.u();
-            let mut n = LifNeuron::new(v_rest0, thr0, 0.0, tau);
+            let mut n = CemLifNeuron::new(v_rest0, thr0, 0.0, tau);
             n.rng = Rand::new(seed.wrapping_mul(2654435761).wrapping_add(h as u32 + 1));
             n.resample_trial();
             units.push(n);
@@ -687,7 +716,7 @@ impl LifEnsemble {
             n.v_rest_dist.set_stddev(STD_EPS);
             n.v_threshold_dist.set_stddev(STD_EPS);
             n.trial_v_rest = n.v_rest_dist.mean;
-            n.trial_v_threshold = n.v_threshold_dist.mean.max(n.v_reset + 0.1);
+            n.trial_v_threshold = n.v_threshold_dist.mean.max(n.cell.v_reset + 0.1);
         }
 
         Self {
@@ -731,6 +760,7 @@ impl LifEnsemble {
             let drive = drives[h].clamp(-FEATURE_CLIP, FEATURE_CLIP);
             let _ = self.units[h].step_with_target(drive, drive, dt);
             self.prev_v[h] = self.units[h]
+                .cell
                 .v_membrane
                 .clamp(-FEATURE_CLIP, FEATURE_CLIP);
         }
@@ -829,8 +859,8 @@ impl LifEnsemble {
         let mut refractory = [false; ENSEMBLE_N];
         let mut rng_states = [0u32; ENSEMBLE_N];
         for h in 0..ENSEMBLE_N {
-            membranes[h] = self.units[h].v_membrane;
-            refractory[h] = self.units[h].is_refractory;
+            membranes[h] = self.units[h].cell.v_membrane;
+            refractory[h] = self.units[h].cell.is_refractory;
             rng_states[h] = self.units[h].rng.lfsr;
         }
         EnsembleDynamicsSnap {
@@ -848,8 +878,8 @@ impl LifEnsemble {
         self.prev_x = snap.prev_x;
         self.prev2_x = snap.prev2_x;
         for h in 0..ENSEMBLE_N {
-            self.units[h].v_membrane = snap.membranes[h];
-            self.units[h].is_refractory = snap.refractory[h];
+            self.units[h].cell.v_membrane = snap.membranes[h];
+            self.units[h].cell.is_refractory = snap.refractory[h];
             self.units[h].rng.lfsr = snap.rng_states[h];
         }
     }
@@ -860,8 +890,8 @@ impl LifEnsemble {
         self.prev_x = [0.0; MAX_DIMS];
         self.prev2_x = [0.0; MAX_DIMS];
         for u in &mut self.units {
-            u.v_membrane = u.trial_v_rest;
-            u.is_refractory = false;
+            u.cell.v_membrane = u.trial_v_rest;
+            u.cell.is_refractory = false;
         }
     }
 }
@@ -1097,8 +1127,6 @@ const SPIKE_LM_TAU: f32 = 5.0;
 const SPIKE_LM_V_REST: f32 = 0.0;
 const SPIKE_LM_V_RESET: f32 = 0.0;
 const SPIKE_LM_V_THR: f32 = 1.0;
-/// Keep CEM search noise tiny so word neurons use the deterministic LIF path.
-const SPIKE_LM_STD: f32 = 0.01;
 /// Peak synaptic drive for the MLE-best next word (supra-threshold in one step).
 const SPIKE_LM_PEAK_DRIVE: f32 = 1.8;
 /// Floor drive for the least-likely next under a context (stays subthreshold).
@@ -2484,34 +2512,24 @@ impl SpikeWordLm {
         let mut rng = Rand::new(seed.max(1));
 
         let mut neurons = Vec::with_capacity(v);
-        for i in 0..v {
-            let mut n = LifNeuron::new(
+        for _ in 0..v {
+            neurons.push(LifNeuron::new(
                 SPIKE_LM_V_REST,
                 SPIKE_LM_V_THR,
                 SPIKE_LM_V_RESET,
                 SPIKE_LM_TAU,
-            );
-            n.rng = Rand::new(seed.wrapping_mul(0x9E37).wrapping_add(i as u32 + 1));
-            n.trial_v_rest = SPIKE_LM_V_REST;
-            n.trial_v_threshold = SPIKE_LM_V_THR;
-            n.v_membrane = SPIKE_LM_V_REST;
-            neurons.push(n);
+            ));
         }
 
         // Context pool: slow leak, high threshold ⇒ continuous memory, rare spikes.
         let mut ctx = Vec::with_capacity(c);
-        for i in 0..c {
-            let mut n = LifNeuron::new(
+        for _ in 0..c {
+            ctx.push(LifNeuron::new(
                 SPIKE_LM_V_REST,
                 SPIKE_LM_CTX_THR,
                 SPIKE_LM_V_RESET,
                 SPIKE_LM_CTX_TAU,
-            );
-            n.rng = Rand::new(seed.wrapping_mul(0x85EB).wrapping_add(i as u32 + 3));
-            n.trial_v_rest = SPIKE_LM_V_REST;
-            n.trial_v_threshold = SPIKE_LM_CTX_THR;
-            n.v_membrane = SPIKE_LM_V_REST;
-            ctx.push(n);
+            ));
         }
 
         // Fixed random word→pool projection (±1/√C).
@@ -2527,7 +2545,7 @@ impl SpikeWordLm {
         let w_out = vec![vec![0.0f32; c]; v];
         let unk = vocab.unk_id();
 
-        let mut model = Self {
+        Self {
             vocab,
             neurons,
             ctx,
@@ -2536,9 +2554,7 @@ impl SpikeWordLm {
             bias: vec![0.0; v],
             last_word: unk,
             rng,
-        };
-        model.pin_search_noise();
-        model
+        }
     }
 
     /// Number of word neurons (== vocab size).
@@ -2551,38 +2567,18 @@ impl SpikeWordLm {
         self.ctx.len()
     }
 
-    /// Force tiny CEM stddevs so steps stay on the deterministic LIF path.
-    fn pin_search_noise(&mut self) {
-        for n in &mut self.neurons {
-            n.v_rest_dist.set_stddev(SPIKE_LM_STD);
-            n.v_threshold_dist.set_stddev(SPIKE_LM_STD);
-            n.trial_v_rest = SPIKE_LM_V_REST;
-            n.trial_v_threshold = SPIKE_LM_V_THR;
-        }
-        for n in &mut self.ctx {
-            n.v_rest_dist.set_stddev(SPIKE_LM_STD);
-            n.v_threshold_dist.set_stddev(SPIKE_LM_STD);
-            n.trial_v_rest = SPIKE_LM_V_REST;
-            n.trial_v_threshold = SPIKE_LM_CTX_THR;
-        }
-    }
-
     /// Reset **word** membranes only (context pool is left intact).
     fn reset_word_membranes(&mut self) {
-        self.pin_search_noise();
         for n in &mut self.neurons {
-            n.v_membrane = SPIKE_LM_V_REST;
-            n.is_refractory = false;
+            n.reset();
         }
     }
 
     /// Reset word membranes **and** clear the context pool.
     pub fn reset_state(&mut self) {
         self.reset_word_membranes();
-        self.pin_search_noise();
         for n in &mut self.ctx {
-            n.v_membrane = SPIKE_LM_V_REST;
-            n.is_refractory = false;
+            n.reset();
         }
         self.last_word = self.vocab.unk_id();
     }
@@ -2592,7 +2588,6 @@ impl SpikeWordLm {
         let v = self.neurons.len().max(1);
         let w = word_id.min(v - 1);
         let c = self.ctx.len();
-        self.pin_search_noise();
 
         // One strong pulse encoding the word via fixed w_in.
         for ci in 0..c {
@@ -2607,7 +2602,6 @@ impl SpikeWordLm {
                 let _ = self.ctx[ci].step(0.0, SPIKE_LM_DT);
             }
         }
-        self.pin_search_noise();
         self.last_word = w;
     }
 
@@ -2635,7 +2629,6 @@ impl SpikeWordLm {
 
     /// One LIF update on every **word** neuron under the given drives.
     fn step_all_words(&mut self, drives: &[f32]) -> Vec<usize> {
-        self.pin_search_noise();
         let v = self.neurons.len();
         let mut spiked = Vec::new();
         for j in 0..v {
@@ -2643,7 +2636,6 @@ impl SpikeWordLm {
                 spiked.push(j);
             }
         }
-        self.pin_search_noise();
         spiked
     }
 
@@ -2737,8 +2729,7 @@ impl SpikeWordLm {
                 self.neurons[j].v_membrane = self.neurons[j].v_reset;
                 self.neurons[j].is_refractory = true;
             } else {
-                self.neurons[j].v_membrane = self.neurons[j].trial_v_rest;
-                self.neurons[j].is_refractory = false;
+                self.neurons[j].reset();
             }
         }
         // Context pool keeps prior state and receives the new word pulse.
@@ -2908,38 +2899,16 @@ impl SpikeWordLm {
     fn predict_next(&mut self) -> usize {
         // Snapshot word + context dynamics so eval does not advance the pool.
         let snap_last = self.last_word;
-        let word_mem: Vec<(f32, bool)> = self
-            .neurons
-            .iter()
-            .map(|n| (n.v_membrane, n.is_refractory))
-            .collect();
-        let ctx_mem: Vec<(f32, bool)> = self
-            .ctx
-            .iter()
-            .map(|n| (n.v_membrane, n.is_refractory))
-            .collect();
+        let word_mem: Vec<LifNeuron> = self.neurons.clone();
+        let ctx_mem: Vec<LifNeuron> = self.ctx.clone();
         let rng_lfsr = self.rng.lfsr;
-        let word_rng: Vec<u32> = self.neurons.iter().map(|n| n.rng.lfsr).collect();
-        let ctx_rng: Vec<u32> = self.ctx.iter().map(|n| n.rng.lfsr).collect();
 
         let pred = self.step_emit(0.0);
 
         self.last_word = snap_last;
         self.rng.lfsr = rng_lfsr;
-        for (n, &(vm, r)) in self.neurons.iter_mut().zip(word_mem.iter()) {
-            n.v_membrane = vm;
-            n.is_refractory = r;
-        }
-        for (n, &(vm, r)) in self.ctx.iter_mut().zip(ctx_mem.iter()) {
-            n.v_membrane = vm;
-            n.is_refractory = r;
-        }
-        for (n, &lfsr) in self.neurons.iter_mut().zip(word_rng.iter()) {
-            n.rng.lfsr = lfsr;
-        }
-        for (n, &lfsr) in self.ctx.iter_mut().zip(ctx_rng.iter()) {
-            n.rng.lfsr = lfsr;
-        }
+        self.neurons = word_mem;
+        self.ctx = ctx_mem;
         pred
     }
 
@@ -3278,13 +3247,26 @@ mod tests {
     }
 
     #[test]
+    fn test_simple_lif_steps_and_spikes() {
+        let mut n = LifNeuron::new(0.0, 1.0, 0.0, 5.0);
+        // Strong drive should cross thr=1 in one step (v ≈ 0.86·I with dt=10,τ=5).
+        assert!(n.step(1.8, 10.0), "expected spike from supra-threshold drive");
+        assert!(n.is_refractory);
+        assert!(!n.step(1.8, 10.0), "refractory step should not spike");
+        assert_eq!(n.v_membrane, n.v_reset);
+        n.reset();
+        assert!(!n.is_refractory);
+        assert_eq!(n.v_membrane, n.v_rest);
+    }
+
+    #[test]
     fn test_spike_resets_search_stddevs() {
-        let mut neuron = LifNeuron::new(0.0, 1.0, 0.0, 10.0);
+        let mut neuron = CemLifNeuron::new(0.0, 1.0, 0.0, 10.0);
         neuron.trial_v_rest = 0.0;
         neuron.trial_v_threshold = 1.0;
         neuron.v_rest_dist.set_stddev(0.01);
         neuron.v_threshold_dist.set_stddev(0.01);
-        neuron.v_membrane = 10.0;
+        neuron.cell.v_membrane = 10.0;
         neuron.pending_antithetic = None;
         neuron.episode_step = 0;
 
@@ -3303,10 +3285,10 @@ mod tests {
 
     #[test]
     fn test_refractory_still_scores_episode() {
-        let mut neuron = LifNeuron::new(0.0, 1.0, 0.0, 10.0);
+        let mut neuron = CemLifNeuron::new(0.0, 1.0, 0.0, 10.0);
         neuron.trial_v_rest = 0.0;
         neuron.trial_v_threshold = 1.0;
-        neuron.v_membrane = 10.0;
+        neuron.cell.v_membrane = 10.0;
         neuron.pending_antithetic = None;
 
         let spiked = neuron.step(0.0, 1.0);
@@ -3320,26 +3302,26 @@ mod tests {
         assert!(!spiked);
         assert_eq!(neuron.input.len(), 2);
         assert_eq!(neuron.output.len(), 2);
-        assert_eq!(neuron.v_membrane, neuron.v_reset);
+        assert_eq!(neuron.cell.v_membrane, neuron.cell.v_reset);
     }
 
     #[test]
     fn test_firing_is_probabilistic_near_threshold() {
         // V near thr mean with non-zero σ ⇒ Monte Carlo majority is stochastic.
-        let mut neuron = LifNeuron::new(0.0, 1.0, 0.0, 1.0e9); // huge τ → V ≈ fixed
+        let mut neuron = CemLifNeuron::new(0.0, 1.0, 0.0, 1.0e9); // huge τ → V ≈ fixed
         neuron.trial_v_rest = 0.0;
         neuron.trial_v_threshold = 1.0;
         neuron.v_rest_dist = GaussianParam::new(0.0, STD_MIN);
         neuron.v_threshold_dist = GaussianParam::new(1.0, 0.5);
-        neuron.v_membrane = 1.0;
+        neuron.cell.v_membrane = 1.0;
         neuron.pending_antithetic = None;
         neuron.episode_step = 0;
 
         let mut spikes = 0u32;
         let trials = 200u32;
         for _ in 0..trials {
-            neuron.v_membrane = 1.0;
-            neuron.is_refractory = false;
+            neuron.cell.v_membrane = 1.0;
+            neuron.cell.is_refractory = false;
             if neuron.step(0.0, 1e-6) {
                 spikes += 1;
             }
@@ -3356,7 +3338,7 @@ mod tests {
 
     #[test]
     fn test_firing_certain_when_far_above_threshold() {
-        let mut neuron = LifNeuron::new(0.0, 1.0, 0.0, 10.0);
+        let mut neuron = CemLifNeuron::new(0.0, 1.0, 0.0, 10.0);
         neuron.trial_v_rest = 0.0;
         neuron.trial_v_threshold = 1.0;
         neuron.v_rest_dist = GaussianParam::new(0.0, STD_MIN);
@@ -3364,8 +3346,8 @@ mod tests {
         neuron.pending_antithetic = None;
 
         for _ in 0..50 {
-            neuron.v_membrane = 5.0;
-            neuron.is_refractory = false;
+            neuron.cell.v_membrane = 5.0;
+            neuron.cell.is_refractory = false;
             neuron.episode_step = 0;
             assert!(
                 neuron.step(0.0, 1.0),
@@ -3376,12 +3358,12 @@ mod tests {
 
     #[test]
     fn test_monte_carlo_majority_fire_decision() {
-        let mut neuron = LifNeuron::new(0.0, 1.0, 0.0, 10.0);
+        let mut neuron = CemLifNeuron::new(0.0, 1.0, 0.0, 10.0);
         neuron.trial_v_rest = 0.0;
         neuron.trial_v_threshold = 0.0;
         neuron.v_rest_dist = GaussianParam::new(0.0, STD_MIN);
         neuron.v_threshold_dist = GaussianParam::new(0.0, STD_MIN);
-        neuron.v_membrane = 1.0;
+        neuron.cell.v_membrane = 1.0;
         neuron.pending_antithetic = None;
         neuron.episode_step = 0;
         // Tiny σ, V well above thr mean ⇒ every MC micro-step fires ⇒ majority fire.
@@ -3389,7 +3371,7 @@ mod tests {
         assert!(fire_hi, "expected majority fire when V >> thr");
         assert!(v_hi.is_finite());
 
-        neuron.v_membrane = -2.0;
+        neuron.cell.v_membrane = -2.0;
         let (v_lo, fire_lo) = neuron.monte_carlo_step(0.0, 1.0);
         assert!(!fire_lo, "expected no fire when V << thr");
         assert!(v_lo.is_finite());
@@ -3397,7 +3379,7 @@ mod tests {
 
     #[test]
     fn test_cem_prefers_low_error_params() {
-        let mut neuron = LifNeuron::new(5.0, 5.0, 0.0, 10.0);
+        let mut neuron = CemLifNeuron::new(5.0, 5.0, 0.0, 10.0);
         let rest_before = neuron.v_rest();
         let thr_before = neuron.v_threshold();
         // Good episodes: rest near 0, threshold moderate.
@@ -3432,7 +3414,7 @@ mod tests {
 
     #[test]
     fn test_learning_reduces_tracking_error() {
-        let mut neuron = LifNeuron::new(3.0, 4.0, 0.0, 10.0);
+        let mut neuron = CemLifNeuron::new(3.0, 4.0, 0.0, 10.0);
         let rest_before = neuron.v_rest().abs();
         let dt = 10.0;
         let mut injected = 1.0f32;

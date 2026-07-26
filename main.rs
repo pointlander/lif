@@ -1164,6 +1164,18 @@ const SPIKE_LM_TRAIN_WORDS: usize = 100_000;
 const SPIKE_LM_EVAL_WORDS: usize = 6_000;
 /// Words to generate after the prompt.
 const SPIKE_LM_SAMPLE_WORDS: usize = 40;
+/// MCTS simulations per emitted word (smaller than char-LM — vocab is larger).
+const SPIKE_MCTS_SIMS: usize = 48;
+/// Expand only the top-k drive-policy actions at each MCTS node.
+const SPIKE_MCTS_TOP_K: usize = 12;
+/// PUCT exploration constant for spike-word MCTS.
+const SPIKE_MCTS_C_PUCT: f32 = 1.25;
+/// Stochastic rollout length (words) after expansion.
+const SPIKE_MCTS_ROLLOUT: usize = 2;
+/// Softmax temperature on drive→prior for MCTS (<1 sharpens).
+const SPIKE_MCTS_POLICY_TEMP: f32 = 0.65;
+/// Log-prob penalty for immediately repeating a word.
+const SPIKE_MCTS_REPEAT_PENALTY: f32 = 0.85;
 
 /// Keep printable ASCII + newline (maps curly quotes etc. away upstream).
 fn is_lm_byte(b: u8) -> bool {
@@ -1240,7 +1252,7 @@ impl WordVocab {
     /// Build a vocab from already-tokenized words: **one entry per unique word**
     /// in `tokens`, ordered by descending frequency (ties broken lexicographically).
     ///
-    /// Id `0` is always `<unk>` (for OOV at eval time). Vocab size is therefore
+    /// Id `0` is always `<unk>` (for OOV at eval time). Vocab size is
     /// `1 + n_unique` (or `1` if `tokens` is empty).
     pub fn from_tokens(tokens: &[String]) -> Self {
         let mut counts: std::collections::HashMap<String, u32> =
@@ -1296,7 +1308,9 @@ impl WordVocab {
 }
 
 /// Split corpus bytes into lowercase word tokens (alphanumeric + apostrophe).
-/// Common punctuation (`. , ! ? ; :`) is kept as its own one-character token.
+///
+/// Punctuation (`. , ! ? ; :`) is emitted as its own one-character token
+/// (so `be.` → `["be", "."]`).
 pub fn tokenize_words(data: &[u8]) -> Vec<String> {
     let s = String::from_utf8_lossy(data);
     let mut words = Vec::new();
@@ -2997,11 +3011,243 @@ impl SpikeWordLm {
         self.score_stream(ids, 1)
     }
 
-    /// Generate `n` words after a prompt string by repeated spike emission.
+    /// Snapshot pool + word membranes for MCTS branching.
+    fn snapshot_spike(&self) -> SpikeWordSnap {
+        SpikeWordSnap {
+            neurons: self.neurons.clone(),
+            ctx: self.ctx.clone(),
+            last_word: self.last_word,
+            rng_lfsr: self.rng.lfsr,
+        }
+    }
+
+    fn restore_spike(&mut self, snap: &SpikeWordSnap) {
+        self.neurons.clone_from(&snap.neurons);
+        self.ctx.clone_from(&snap.ctx);
+        self.last_word = snap.last_word;
+        self.rng.lfsr = snap.rng_lfsr;
+    }
+
+    /// Softmax policy over generation drives from the context pool.
+    fn gen_policy(&self) -> Vec<f32> {
+        let drives = self.drives();
+        let t = SPIKE_MCTS_POLICY_TEMP.max(1e-3);
+        let mut max_d = f32::NEG_INFINITY;
+        for &d in &drives {
+            if d > max_d {
+                max_d = d;
+            }
+        }
+        let mut p = vec![0.0f32; drives.len()];
+        let mut z = 0.0f32;
+        for (i, &d) in drives.iter().enumerate() {
+            let e = ((d - max_d) / t).exp();
+            p[i] = e;
+            z += e;
+        }
+        let inv = 1.0 / z.max(1e-12);
+        for x in &mut p {
+            *x *= inv;
+        }
+        p
+    }
+
+    fn top_k_actions(probs: &[f32], k: usize) -> Vec<usize> {
+        let mut idx: Vec<usize> = (0..probs.len()).collect();
+        idx.sort_by(|&a, &b| {
+            probs[b]
+                .partial_cmp(&probs[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        idx.truncate(k.min(probs.len()).max(1));
+        idx
+    }
+
+    fn sample_from_probs(&mut self, probs: &[f32], temperature: f32) -> usize {
+        if temperature <= 1e-6 {
+            return argmax_f32(probs);
+        }
+        let inv_t = 1.0 / temperature.max(1e-3);
+        let mut logits: Vec<f32> = probs
+            .iter()
+            .map(|p| p.max(1e-12).ln() * inv_t)
+            .collect();
+        let mut max = f32::NEG_INFINITY;
+        for &z in &logits {
+            if z > max {
+                max = z;
+            }
+        }
+        let mut sum = 0.0f32;
+        for z in &mut logits {
+            *z = (*z - max).exp();
+            sum += *z;
+        }
+        let inv = 1.0 / sum.max(1e-12);
+        for z in &mut logits {
+            *z *= inv;
+        }
+        let mut r = self.rng.u();
+        let mut pick = logits.len().saturating_sub(1);
+        for (i, &p) in logits.iter().enumerate() {
+            if r < p {
+                pick = i;
+                break;
+            }
+            r -= p;
+        }
+        pick
+    }
+
+    /// Log-prob of taking `act` under `probs`, with a mild anti-stutter penalty.
+    fn action_value_lp(&self, probs: &[f32], act: usize, last_word: usize) -> f32 {
+        let mut lp = probs.get(act).copied().unwrap_or(1e-12).max(1e-12).ln();
+        if act == last_word {
+            lp -= SPIKE_MCTS_REPEAT_PENALTY;
+        }
+        lp
+    }
+
+    /// Choose next word with **MCTS + PUCT** under the spike-drive policy.
     ///
-    /// Returns a space-joined string (punctuation tokens are not space-padded
-    /// on the left when single-character punctuation).
-    pub fn generate(&mut self, prompt: &str, n: usize, temperature: f32) -> String {
+    /// Prior at each state = softmax of generation drives (period-boosted).
+    /// State is the shared context pool + last word; branching snapshots and
+    /// restores pool membranes so real generation only commits the final pick.
+    fn mcts_select_word(&mut self, temperature: f32) -> usize {
+        let root_snap = self.snapshot_spike();
+        let root_prior = self.gen_policy();
+        let root_actions = Self::top_k_actions(&root_prior, SPIKE_MCTS_TOP_K);
+
+        let mut nodes: Vec<MctsNode> = vec![MctsNode {
+            action: 0,
+            prior: 1.0,
+            n: 0.0,
+            w: 0.0,
+            children: Vec::new(),
+            unexpanded: root_actions
+                .iter()
+                .map(|&a| (a, root_prior[a].max(MCTS_PRIOR_FLOOR)))
+                .collect(),
+        }];
+
+        for _ in 0..SPIKE_MCTS_SIMS {
+            self.restore_spike(&root_snap);
+            let mut path: Vec<usize> = vec![0];
+            let mut node = 0usize;
+            let mut path_logp = 0.0f32;
+            let mut cur_last = self.last_word;
+
+            // Selection: PUCT among expanded children.
+            while nodes[node].unexpanded.is_empty() && !nodes[node].children.is_empty() {
+                let parent_n = nodes[node].n.max(1.0);
+                let mut best_child = nodes[node].children[0];
+                let mut best_score = f32::NEG_INFINITY;
+                for &ch in &nodes[node].children {
+                    let c = &nodes[ch];
+                    let q = if c.n > 0.0 { c.w / c.n } else { 0.0 };
+                    let u = SPIKE_MCTS_C_PUCT * c.prior * parent_n.sqrt() / (1.0 + c.n);
+                    let score = q + u;
+                    if score > best_score {
+                        best_score = score;
+                        best_child = ch;
+                    }
+                }
+                let act = nodes[best_child].action;
+                let probs = self.gen_policy();
+                path_logp += self.action_value_lp(&probs, act, cur_last);
+                self.observe(act);
+                cur_last = act;
+                path.push(best_child);
+                node = best_child;
+            }
+
+            // Expansion: open one untried action (highest prior).
+            let mut first_step_lp = 0.0f32;
+            if !nodes[node].unexpanded.is_empty() {
+                let mut pick = 0usize;
+                let mut best_p = -1.0f32;
+                for (i, &(_, p)) in nodes[node].unexpanded.iter().enumerate() {
+                    if p > best_p {
+                        best_p = p;
+                        pick = i;
+                    }
+                }
+                let (act, prior) = nodes[node].unexpanded.swap_remove(pick);
+                let probs = self.gen_policy();
+                let lp = self.action_value_lp(&probs, act, cur_last);
+                if path.len() == 1 {
+                    first_step_lp = lp;
+                }
+                path_logp += lp;
+                self.observe(act);
+                cur_last = act;
+
+                let child_prior = self.gen_policy();
+                let child_actions = Self::top_k_actions(&child_prior, SPIKE_MCTS_TOP_K);
+                let child = nodes.len();
+                nodes.push(MctsNode {
+                    action: act,
+                    prior: prior.max(MCTS_PRIOR_FLOOR),
+                    n: 0.0,
+                    w: 0.0,
+                    children: Vec::new(),
+                    unexpanded: child_actions
+                        .iter()
+                        .map(|&a| (a, child_prior[a].max(MCTS_PRIOR_FLOOR)))
+                        .collect(),
+                });
+                nodes[node].children.push(child);
+                path.push(child);
+            }
+
+            // Short stochastic rollout under drive policy.
+            let mut rollout_logp = 0.0f32;
+            let roll_temp = temperature.clamp(0.45, 0.85);
+            for _ in 0..SPIKE_MCTS_ROLLOUT {
+                let probs = self.gen_policy();
+                let a = self.sample_from_probs(&probs, roll_temp);
+                rollout_logp += self.action_value_lp(&probs, a, cur_last);
+                self.observe(a);
+                cur_last = a;
+            }
+
+            let deep_steps = (path.len().saturating_sub(1) + SPIKE_MCTS_ROLLOUT).max(1) as f32;
+            let deep = (path_logp + rollout_logp) / deep_steps;
+            let value = if first_step_lp != 0.0 {
+                MCTS_IMMEDIATE_WEIGHT * first_step_lp
+                    + (1.0 - MCTS_IMMEDIATE_WEIGHT) * deep
+            } else {
+                deep
+            };
+
+            for &ni in path.iter().rev() {
+                nodes[ni].n += 1.0;
+                nodes[ni].w += value;
+            }
+        }
+
+        self.restore_spike(&root_snap);
+
+        if nodes[0].children.is_empty() {
+            return argmax_f32(&root_prior);
+        }
+        // Prefer most-visited child; break ties with Q and prior.
+        let mut best_a = nodes[nodes[0].children[0]].action;
+        let mut best_score = f32::NEG_INFINITY;
+        for &ch in &nodes[0].children {
+            let c = &nodes[ch];
+            let q = if c.n > 0.0 { c.w / c.n } else { f32::NEG_INFINITY };
+            let score = c.n + 0.35 * q + 0.5 * c.prior.ln();
+            if score > best_score {
+                best_score = score;
+                best_a = c.action;
+            }
+        }
+        best_a
+    }
+
+    /// One-step greedy/sampled emission (no tree search).
+    pub fn generate_direct(&mut self, prompt: &str, n: usize, temperature: f32) -> String {
         self.reset_state();
         let prompt_tokens = tokenize_words(prompt.as_bytes());
         let mut out_words: Vec<String> = if prompt_tokens.is_empty() {
@@ -3018,6 +3264,38 @@ impl SpikeWordLm {
         }
         join_word_tokens(&out_words)
     }
+
+    /// Generate `n` words after `prompt` with **MCTS + PUCT** on spike drives.
+    ///
+    /// Each step runs [`SPIKE_MCTS_SIMS`] simulations. Prompt tokens are
+    /// teacher-forced into the context pool.
+    pub fn generate(&mut self, prompt: &str, n: usize, temperature: f32) -> String {
+        self.reset_state();
+        let prompt_tokens = tokenize_words(prompt.as_bytes());
+        let mut out_words: Vec<String> = if prompt_tokens.is_empty() {
+            vec!["the".to_string()]
+        } else {
+            prompt_tokens
+        };
+        for w in &out_words {
+            self.observe(self.vocab.encode(w));
+        }
+        for _ in 0..n {
+            let id = self.mcts_select_word(temperature);
+            self.observe(id);
+            out_words.push(self.vocab.decode(id).to_string());
+        }
+        join_word_tokens(&out_words)
+    }
+}
+
+/// Dynamics snapshot for spike-word MCTS (word bank + context pool + RNG).
+#[derive(Clone, Debug)]
+struct SpikeWordSnap {
+    neurons: Vec<LifNeuron>,
+    ctx: Vec<LifNeuron>,
+    last_word: usize,
+    rng_lfsr: u32,
 }
 
 /// Join word tokens with spaces, attaching single-char punctuation without a
@@ -3025,7 +3303,8 @@ impl SpikeWordLm {
 fn join_word_tokens(words: &[String]) -> String {
     let mut s = String::new();
     for w in words {
-        let is_punct = w.len() == 1 && matches!(w.as_bytes()[0], b'.' | b',' | b'!' | b'?' | b';' | b':');
+        let is_punct = w.len() == 1
+            && matches!(w.as_bytes()[0], b'.' | b',' | b'!' | b'?' | b';' | b':');
         if s.is_empty() {
             s.push_str(w);
         } else if is_punct {
@@ -3163,18 +3442,22 @@ fn run_spike_word_lm(path: &str) -> Result<(), String> {
 
     let prompt = "To be, or not to be";
     println!();
-    println!("spike-generate words: max_ticks={SPIKE_LM_MAX_TICKS} temp=0.7 n={SPIKE_LM_SAMPLE_WORDS}");
+    println!(
+        "spike-MCTS generate: sims={SPIKE_MCTS_SIMS} top_k={SPIKE_MCTS_TOP_K} rollout={SPIKE_MCTS_ROLLOUT} \
+         c_puct={SPIKE_MCTS_C_PUCT} n={SPIKE_LM_SAMPLE_WORDS}"
+    );
     let sample = model.generate(prompt, SPIKE_LM_SAMPLE_WORDS, 0.7);
-    println!("sample spike-emit words (temp=0.7, prompt+{SPIKE_LM_SAMPLE_WORDS} words):");
+    println!("sample spike-MCTS (temp=0.7, prompt+{SPIKE_LM_SAMPLE_WORDS} words):");
     println!("----");
     println!("{sample}");
     println!("----");
     println!(
-        "{{spike_word_lm: {{\"train_acc\": {:.6}, \"eval_acc\": {:.6}, \"eval_ppl\": {:.4}, \"neurons\": {}}}}}",
+        "{{spike_word_lm: {{\"train_acc\": {:.6}, \"eval_acc\": {:.6}, \"eval_ppl\": {:.4}, \"neurons\": {}, \"mcts_sims\": {}}}}}",
         train_stats.accuracy,
         eval_stats.accuracy,
         eval_stats.perplexity,
-        model.n_words()
+        model.n_words(),
+        SPIKE_MCTS_SIMS
     );
     Ok(())
 }
@@ -3614,12 +3897,18 @@ mod tests {
                 .map(String::from)
                 .collect::<Vec<_>>()
         );
+        // "." is its own token, not glued onto "be".
+        assert!(toks.iter().any(|t| t == "."));
+        assert!(!toks.iter().any(|t| t != "." && t.contains('.')));
+
         let vocab = WordVocab::from_tokens(&toks);
         assert_eq!(vocab.decode(0), "<unk>");
-        // unique: to, be, ,, or, not, .  → 6 + <unk>
+        // unique: to, be, ,, or, not, . → 6 + <unk>
         assert_eq!(vocab.len(), 7);
         assert_eq!(vocab.encode("be"), vocab.encode("be"));
+        assert_eq!(vocab.decode(vocab.encode(".")), ".");
         assert_eq!(vocab.decode(vocab.encode("xyzzy")), "<unk>");
+        assert_eq!(join_word_tokens(&toks), "to be, or not to be.");
     }
 
     #[test]
@@ -3628,7 +3917,8 @@ mod tests {
         let text = "cat dog fish cat dog fish cat dog fish cat dog fish cat dog fish cat dog fish ";
         let tokens = tokenize_words(text.as_bytes());
         let vocab = WordVocab::from_tokens(&tokens);
-        assert_eq!(vocab.len(), 4); // <unk> + cat, dog, fish
+        // <unk> + cat, dog, fish
+        assert_eq!(vocab.len(), 4);
         let ids = vocab.encode_tokens(&tokens);
         let mut model = SpikeWordLm::new(vocab, 99);
         assert_eq!(model.n_words(), model.vocab.len());
@@ -3653,10 +3943,16 @@ mod tests {
             "after 'cat', expected 'dog' neuron to spike/emit"
         );
 
-        let sample = model.generate("cat dog", 9, 0.0);
+        // Direct emit (no tree) for a cheap cycle check.
+        let sample = model.generate_direct("cat dog", 9, 0.0);
         assert!(sample.contains("fish") || sample.contains("cat") || sample.contains("dog"));
         let sample_toks = tokenize_words(sample.as_bytes());
         assert!(sample_toks.len() >= 5);
+
+        // Short MCTS sample exercises search + pool snapshots.
+        let mcts_sample = model.generate("cat", 4, 0.5);
+        assert!(mcts_sample.split_whitespace().count() >= 3);
+        assert!(std::str::from_utf8(mcts_sample.as_bytes()).is_ok());
     }
 
     #[test]
@@ -3688,13 +3984,16 @@ mod tests {
             "expected pool-context spike LM above chance, eval_acc={}",
             eval_stats.accuracy
         );
-        let sample = model.generate("to be or not", 20, 0.5);
+        let sample = model.generate_direct("to be or not", 20, 0.5);
         assert!(!sample.is_empty());
         let uniq: std::collections::BTreeSet<&str> = sample.split_whitespace().collect();
         assert!(
             uniq.len() >= 3,
             "degenerate sample: {sample:?}"
         );
+        // MCTS path (few words) on a warm pool after direct gen.
+        let mcts = model.generate("to be", 3, 0.6);
+        assert!(mcts.split_whitespace().count() >= 3);
     }
 
     #[test]

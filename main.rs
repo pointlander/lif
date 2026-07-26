@@ -4378,7 +4378,94 @@ fn run_benchmark_suite(steps: usize, dt: f32) -> Vec<BenchResult> {
     ]
 }
 
-fn main() {
+/// Which demo stages to run. With no CLI flags, all stages run.
+#[derive(Clone, Copy, Debug)]
+struct RunFlags {
+    /// CEM-LIF ensemble benchmark suite.
+    ensemble: bool,
+    /// Character LifEnsemble + RF block-adjacency LM.
+    language_model: bool,
+    /// Spike-emission word LM (+ MCTS).
+    spike_word: bool,
+}
+
+impl RunFlags {
+    /// Parse `args` (excluding program name). No stage flags ⇒ run everything.
+    fn from_args(args: &[String]) -> Result<Self, String> {
+        let mut ensemble = false;
+        let mut language_model = false;
+        let mut spike_word = false;
+        let mut any_stage = false;
+
+        for a in args {
+            match a.as_str() {
+                "-h" | "--help" => {
+                    print_cli_help();
+                    std::process::exit(0);
+                }
+                "--ensemble" | "--cem" | "--bench" => {
+                    ensemble = true;
+                    any_stage = true;
+                }
+                "--lm" | "--language-model" => {
+                    language_model = true;
+                    any_stage = true;
+                }
+                "--spike" | "--spike-word" | "--spike-lm" => {
+                    spike_word = true;
+                    any_stage = true;
+                }
+                other => {
+                    return Err(format!(
+                        "unknown argument: {other}\nRun with --help for usage."
+                    ));
+                }
+            }
+        }
+
+        if !any_stage {
+            // Default: full pipeline.
+            ensemble = true;
+            language_model = true;
+            spike_word = true;
+        }
+        Ok(Self {
+            ensemble,
+            language_model,
+            spike_word,
+        })
+    }
+}
+
+fn print_cli_help() {
+    println!(
+        "\
+lif — CEM-LIF ensemble, character LM, spike-word LM
+
+USAGE:
+    lif [OPTIONS]
+
+OPTIONS:
+    --ensemble, --cem, --bench
+            Run CEM-LIF ensemble benchmark suite only (or with other flags).
+
+    --lm, --language-model
+            Run character LifEnsemble + RF block-adjacency language model.
+
+    --spike, --spike-word, --spike-lm
+            Run spike-emission word language model (context pool + MCTS).
+
+    -h, --help
+            Show this help.
+
+With no stage flags, all three stages run in order.
+Combine flags to run a subset, e.g.  lif --spike --lm
+"
+    );
+}
+
+/// CEM-LIF ensemble tracking / next-step benchmarks.
+fn run_cem_ensemble_benchmarks() {
     println!(
         "CEM-LIF ensemble: units={ENSEMBLE_N} pop={POP_SIZE} episode={EPISODE_LEN} \
          elite={ELITE_COUNT} readout_lr={READOUT_LR} passes={TRAIN_PASSES} \
@@ -4402,7 +4489,6 @@ fn main() {
         );
     }
 
-    // Compact machine-readable line for scripts / CI.
     let total_mae: f32 = results.iter().map(|r| r.mae).sum();
     println!();
     println!(
@@ -4414,15 +4500,33 @@ fn main() {
             .join(", ")
     );
     println!("{{total_mae: {:.6}}}", total_mae);
+}
 
-    // Character LM on Shakespeare (eBook #100): ensemble+RF block model, then
-    // the spike-emission word model (one LifNeuron per word).
-    if let Err(e) = run_language_model(LM_CORPUS_PATH) {
-        eprintln!("language model error: {e}");
-        std::process::exit(1);
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let flags = match RunFlags::from_args(&args) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
+
+    if flags.ensemble {
+        run_cem_ensemble_benchmarks();
     }
-    if let Err(e) = run_spike_word_lm(LM_CORPUS_PATH) {
-        eprintln!("spike-word language model error: {e}");
-        std::process::exit(1);
+
+    if flags.language_model {
+        if let Err(e) = run_language_model(LM_CORPUS_PATH) {
+            eprintln!("language model error: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    if flags.spike_word {
+        if let Err(e) = run_spike_word_lm(LM_CORPUS_PATH) {
+            eprintln!("spike-word language model error: {e}");
+            std::process::exit(1);
+        }
     }
 }

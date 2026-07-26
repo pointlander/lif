@@ -1164,14 +1164,14 @@ const SPIKE_LM_TRAIN_WORDS: usize = 100_000;
 const SPIKE_LM_EVAL_WORDS: usize = 6_000;
 /// Words to generate after the prompt.
 const SPIKE_LM_SAMPLE_WORDS: usize = 40;
-/// MCTS simulations per emitted word (smaller than char-LM — vocab is larger).
-const SPIKE_MCTS_SIMS: usize = 48;
+/// MCTS simulations per emitted word (more sims ⇒ deeper tree via expansion).
+const SPIKE_MCTS_SIMS: usize = 192;
 /// Expand only the top-k drive-policy actions at each MCTS node.
-const SPIKE_MCTS_TOP_K: usize = 12;
+const SPIKE_MCTS_TOP_K: usize = 14;
 /// PUCT exploration constant for spike-word MCTS.
 const SPIKE_MCTS_C_PUCT: f32 = 1.25;
-/// Stochastic rollout length (words) after expansion.
-const SPIKE_MCTS_ROLLOUT: usize = 2;
+/// Stochastic rollout length (words) after expansion — main search depth signal.
+const SPIKE_MCTS_ROLLOUT: usize = 8;
 /// Softmax temperature on drive→prior for MCTS (<1 sharpens).
 const SPIKE_MCTS_POLICY_TEMP: f32 = 0.65;
 /// Log-prob penalty for immediately repeating a word.

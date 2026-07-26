@@ -1143,8 +1143,10 @@ const SPIKE_LM_CTX_THR: f32 = 50.0;
 const SPIKE_LM_CTX_PULSE: f32 = 3.2;
 /// Extra zero-drive pool ticks after a word pulse (leak + mix).
 const SPIKE_LM_CTX_EXTRA_TICKS: usize = 1;
-/// Max sub-steps waiting for a spontaneous spike before WTA fallback.
-const SPIKE_LM_MAX_TICKS: usize = 4;
+/// Max sub-steps in the word-layer multi-tick race under shared inhibition.
+const SPIKE_LM_MAX_TICKS: usize = 6;
+/// Lateral inhibition gain: each word sees `I_j − gain · mean_{k≠j} relu(V_k)`.
+const SPIKE_LM_INH_GAIN: f32 = 0.55;
 /// Learning rate for pool→word readout (LMS / Hebbian).
 const SPIKE_LM_LR: f32 = 0.12;
 /// LMS epochs over the train stream when seeding the readout.
@@ -2644,16 +2646,69 @@ impl SpikeWordLm {
         d
     }
 
-    /// One LIF update on every **word** neuron under the given drives.
-    fn step_all_words(&mut self, drives: &[f32]) -> Vec<usize> {
+    /// One race tick: **lateral inhibition** from other word membranes, then LIF step.
+    ///
+    /// Shared inhibition for unit \(j\):
+    /// \(I^{\mathrm{eff}}_j = I_j - g \cdot \mathrm{mean}_{k \ne j}\operatorname{relu}(V_k)\).
+    /// Returns ids that spiked this tick (usually 0 or 1 after competition).
+    fn race_tick(&mut self, base_drives: &[f32]) -> Vec<usize> {
         let v = self.neurons.len();
+        if v == 0 {
+            return Vec::new();
+        }
+        let mut act = vec![0.0f32; v];
+        let mut total = 0.0f32;
+        for j in 0..v {
+            let a = self.neurons[j].v_membrane.max(0.0);
+            act[j] = a;
+            total += a;
+        }
+        let inv_others = 1.0 / (v.saturating_sub(1).max(1) as f32);
+        let g = SPIKE_LM_INH_GAIN;
+
         let mut spiked = Vec::new();
         for j in 0..v {
-            if self.neurons[j].step(drives[j], SPIKE_LM_DT) {
+            let others_mean = (total - act[j]) * inv_others;
+            let i_eff = base_drives[j] - g * others_mean;
+            if self.neurons[j].step(i_eff, SPIKE_LM_DT) {
                 spiked.push(j);
             }
         }
         spiked
+    }
+
+    /// Pick a winner among simultaneous spikers (membrane WTA, optional temp sample).
+    fn pick_spiker(&mut self, spiked: &[usize], drives: &[f32], temperature: f32) -> usize {
+        if spiked.is_empty() {
+            return 0;
+        }
+        if spiked.len() == 1 {
+            return spiked[0];
+        }
+        let v = self.neurons.len();
+        if temperature <= 1e-3 {
+            return spiked
+                .iter()
+                .copied()
+                .max_by(|&a, &b| {
+                    self.neurons[a]
+                        .v_membrane
+                        .partial_cmp(&self.neurons[b].v_membrane)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| {
+                            drives[a]
+                                .partial_cmp(&drives[b])
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                })
+                .unwrap_or(0);
+        }
+        let mut scores = vec![f32::NEG_INFINITY; v];
+        for &j in spiked {
+            // Prefer membrane (who actually won the race), blend base drive.
+            scores[j] = self.neurons[j].v_membrane + 0.25 * drives[j];
+        }
+        self.sample_from_scores(&scores, temperature)
     }
 
     fn sample_from_scores(&mut self, scores: &[f32], temperature: f32) -> usize {
@@ -2753,8 +2808,13 @@ impl SpikeWordLm {
         self.inject_word_to_pool(e);
     }
 
-    /// Integrate word neurons under pool-driven currents until someone spikes
-    /// (or timeout). Returns the **emitted** word id.
+    /// Multi-tick **race** under shared lateral inhibition until a word spikes.
+    ///
+    /// 1. Reset word membranes; freeze pool-derived base drives \(I_j\).
+    /// 2. For up to [`SPIKE_LM_MAX_TICKS`] ticks, each unit receives
+    ///    \(I_j - g\cdot\mathrm{mean}_{k\ne j}\operatorname{relu}(V_k)\) and integrates.
+    /// 3. First tick with ≥1 spike: emit the winner (membrane WTA if several).
+    /// 4. Timeout: soft-emit argmax membrane / drive.
     ///
     /// Core rule: **a spike emits that word**.
     pub fn step_emit(&mut self, temperature: f32) -> usize {
@@ -2762,45 +2822,33 @@ impl SpikeWordLm {
         if v == 0 {
             return 0;
         }
-        // Read persistent context pool; only word membranes are refreshed.
         let drives = self.drives();
         self.reset_word_membranes();
 
         for _tick in 0..SPIKE_LM_MAX_TICKS {
-            let spiked = self.step_all_words(&drives);
+            let spiked = self.race_tick(&drives);
             if spiked.is_empty() {
                 continue;
             }
-            let emitted = if temperature <= 1e-3 {
-                spiked
-                    .iter()
-                    .copied()
-                    .max_by(|&a, &b| {
-                        drives[a]
-                            .partial_cmp(&drives[b])
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .unwrap_or(0)
-            } else {
-                let mut scores = vec![f32::NEG_INFINITY; v];
-                for &j in &spiked {
-                    scores[j] = drives[j];
-                }
-                self.sample_from_scores(&scores, temperature)
-            };
+            let emitted = self.pick_spiker(&spiked, &drives, temperature);
             self.commit_emit(emitted);
             return emitted;
         }
 
+        // No spike in the race window: soft-emit from membrane + base drive.
+        let mut scores = vec![0.0f32; v];
+        for j in 0..v {
+            scores[j] = self.neurons[j].v_membrane + 0.35 * drives[j];
+        }
         let emitted = if temperature <= 1e-3 {
-            drives
+            scores
                 .iter()
                 .enumerate()
                 .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(i, _)| i)
                 .unwrap_or(0)
         } else {
-            self.sample_from_scores(&drives, temperature)
+            self.sample_from_scores(&scores, temperature)
         };
         self.commit_emit(emitted);
         emitted
@@ -2892,7 +2940,7 @@ impl SpikeWordLm {
         self.reset_word_membranes();
         let mut spiked = Vec::new();
         for _tick in 0..SPIKE_LM_MAX_TICKS {
-            spiked = self.step_all_words(&drives);
+            spiked = self.race_tick(&drives);
             if !spiked.is_empty() {
                 break;
             }

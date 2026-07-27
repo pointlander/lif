@@ -1118,6 +1118,147 @@ const SA_DEDUP_PRIOR_SCALE: f32 = 0.35;
 const SA_DEDUP_VALUE_PENALTY: f32 = 2.0;
 
 // ---------------------------------------------------------------------------
+// SIMD f32 dot product (x86 SSE/AVX, ARM NEON, scalar fallback)
+// ---------------------------------------------------------------------------
+
+/// \(a\cdot b\) for equal-length (or min-length) `f32` slices using vector ISAs.
+///
+/// Dispatch:
+/// - **x86/x86_64**: runtime AVX → SSE2 → scalar
+/// - **aarch64**: NEON (baseline)
+/// - **other**: scalar
+#[inline]
+fn simd_dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    if n == 0 {
+        return 0.0;
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        // Prefer wider vectors when the CPU supports them.
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx") {
+                return unsafe { dot_f32_avx(a, b, n) };
+            }
+        }
+        if is_x86_feature_detected!("sse2") {
+            return unsafe { dot_f32_sse2(a, b, n) };
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { dot_f32_neon(a, b, n) };
+    }
+
+    #[allow(unreachable_code)]
+    dot_f32_scalar(a, b, n)
+}
+
+#[inline]
+fn dot_f32_scalar(a: &[f32], b: &[f32], n: usize) -> f32 {
+    let mut s = 0.0f32;
+    for i in 0..n {
+        s += a[i] * b[i];
+    }
+    s
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "sse2")]
+unsafe fn dot_f32_sse2(a: &[f32], b: &[f32], n: usize) -> f32 {
+    // Rust 2024: unsafe bodies need explicit `unsafe` for arch intrinsics.
+    unsafe {
+        #[cfg(target_arch = "x86")]
+        use std::arch::x86::*;
+        #[cfg(target_arch = "x86_64")]
+        use std::arch::x86_64::*;
+
+        let mut i = 0usize;
+        let mut acc = _mm_setzero_ps();
+        while i + 4 <= n {
+            let va = _mm_loadu_ps(a.as_ptr().add(i));
+            let vb = _mm_loadu_ps(b.as_ptr().add(i));
+            acc = _mm_add_ps(acc, _mm_mul_ps(va, vb));
+            i += 4;
+        }
+        // Horizontal sum of acc = [a0,a1,a2,a3]
+        let shuf = _mm_shuffle_ps(acc, acc, 0b10_11_00_01); // a1,a0,a3,a2
+        let sums = _mm_add_ps(acc, shuf);
+        let shuf2 = _mm_movehl_ps(sums, sums); // a3+a2, ...
+        let sums2 = _mm_add_ss(sums, shuf2);
+        let mut sum = _mm_cvtss_f32(sums2);
+        while i < n {
+            sum += a[i] * b[i];
+            i += 1;
+        }
+        sum
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn dot_f32_avx(a: &[f32], b: &[f32], n: usize) -> f32 {
+    unsafe {
+        use std::arch::x86_64::*;
+
+        let mut i = 0usize;
+        let mut acc = _mm256_setzero_ps();
+        while i + 8 <= n {
+            let va = _mm256_loadu_ps(a.as_ptr().add(i));
+            let vb = _mm256_loadu_ps(b.as_ptr().add(i));
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(va, vb));
+            i += 8;
+        }
+        // Horizontal sum of 8 lanes via 128-bit halves (no SSE3-only ops).
+        let hi = _mm256_extractf128_ps(acc, 1);
+        let lo = _mm256_castps256_ps128(acc);
+        let sum128 = _mm_add_ps(lo, hi);
+        let mut tmp = [0.0f32; 4];
+        _mm_storeu_ps(tmp.as_mut_ptr(), sum128);
+        let mut sum = tmp[0] + tmp[1] + tmp[2] + tmp[3];
+        // Tail with SSE2-sized chunks then scalar.
+        while i + 4 <= n {
+            sum += a[i] * b[i]
+                + a[i + 1] * b[i + 1]
+                + a[i + 2] * b[i + 2]
+                + a[i + 3] * b[i + 3];
+            i += 4;
+        }
+        while i < n {
+            sum += a[i] * b[i];
+            i += 1;
+        }
+        sum
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn dot_f32_neon(a: &[f32], b: &[f32], n: usize) -> f32 {
+    unsafe {
+        use std::arch::aarch64::*;
+
+        let mut i = 0usize;
+        let mut acc = vdupq_n_f32(0.0);
+        while i + 4 <= n {
+            let va = vld1q_f32(a.as_ptr().add(i));
+            let vb = vld1q_f32(b.as_ptr().add(i));
+            acc = vfmaq_f32(acc, va, vb); // acc + va*vb
+            i += 4;
+        }
+        let mut sum = vaddvq_f32(acc); // horizontal add (ARMv8)
+        while i < n {
+            sum += a[i] * b[i];
+            i += 1;
+        }
+        sum
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Spike-emission LM: one LifNeuron per word; spike ⇒ emit that word
 // ---------------------------------------------------------------------------
 
@@ -1180,6 +1321,10 @@ const SPIKE_BEAM_WIDTH: usize = 6;
 const SPIKE_BEAM_CAND_K: usize = 8;
 /// Mild penalty (nats) for immediately repeating the previous surface word in beam search.
 const SPIKE_BEAM_REPEAT_PENALTY: f32 = 0.75;
+/// Coverage / frequency penalty scale: \(s' = s - \alpha\, c(w)^\beta\).
+const SPIKE_BEAM_COVER_ALPHA: f32 = 1.0;
+/// Coverage penalty exponent on prior count \(c(w)\) in the hypothesis path.
+const SPIKE_BEAM_COVER_BETA: f32 = 1.0;
 
 /// Keep printable ASCII + newline (maps curly quotes etc. away upstream).
 fn is_lm_byte(b: u8) -> bool {
@@ -2658,18 +2803,18 @@ impl SpikeWordLm {
     }
 
     /// Drive into word neurons from bias + linear readout of the context pool.
+    ///
+    /// Matvec \(I_j = b_j + W_j\cdot\phi(V_{\mathrm{ctx}})\); each row uses a
+    /// SIMD dot product (x86 SSE/AVX, ARM NEON, scalar fallback).
     fn drives(&self) -> Vec<f32> {
         let v = self.neurons.len();
         let feats = self.ctx_features();
-        let c = feats.len();
+        if v == 0 {
+            return Vec::new();
+        }
         let mut d = vec![0.0f32; v];
         for j in 0..v {
-            let mut s = self.bias[j];
-            let row = &self.w_out[j];
-            for ci in 0..c {
-                s += row[ci] * feats[ci];
-            }
-            d[j] = s;
+            d[j] = self.bias[j] + simd_dot_f32(&self.w_out[j], &feats);
         }
         d
     }
@@ -3307,10 +3452,33 @@ impl TripleSpikeWordLm {
         out
     }
 
+    /// Count of `word` already present in prompt + generated path (coverage \(c(w)\)).
+    fn path_count(prompt: &[String], generated: &[String], word: &str) -> u32 {
+        let mut c = 0u32;
+        for w in prompt.iter().chain(generated.iter()) {
+            if w == word {
+                c += 1;
+            }
+        }
+        c
+    }
+
+    /// Coverage penalty \(\alpha\, c(w)^\beta\) for prior occurrences on the path.
+    fn coverage_penalty(count: u32) -> f32 {
+        if count == 0 || SPIKE_BEAM_COVER_ALPHA <= 0.0 {
+            return 0.0;
+        }
+        let c = count as f32;
+        let beta = SPIKE_BEAM_COVER_BETA.max(0.0);
+        SPIKE_BEAM_COVER_ALPHA * c.powf(beta)
+    }
+
     /// Cooperative multi-agent **beam search** for coherent multi-model text.
     ///
     /// At each step expands the union of per-model top-k words, scores with
-    /// \(s(w)=\sum_i\log p_i(w)\), and keeps the best [`SPIKE_BEAM_WIDTH`] paths.
+    /// \(s'(w)=s(w)-\alpha\,c(w)^\beta\) where \(s=\sum_i\log p_i\) and \(c(w)\) is
+    /// how often \(w\) already appears on the hypothesis (prompt + path), and
+    /// keeps the best [`SPIKE_BEAM_WIDTH`] paths.
     /// After `n` steps, restores the winning hypothesis state into `self`.
     pub fn generate_beam(&mut self, prompt: &str, n: usize, beam_width: usize) -> String {
         self.reset_state();
@@ -3348,6 +3516,10 @@ impl TripleSpikeWordLm {
                 for w in cands {
                     Self::restore_all(&mut self.players, &hyp.snaps);
                     let mut step_s = Self::joint_logp(&self.players, &w);
+                    // (1) Coverage / frequency penalty on prior path count.
+                    let prior_c = Self::path_count(&prompt_words, &hyp.words, &w);
+                    step_s -= Self::coverage_penalty(prior_c);
+                    // Extra nudge against immediate bigram repeat.
                     if prev.as_deref() == Some(w.as_str()) {
                         step_s -= SPIKE_BEAM_REPEAT_PENALTY;
                     }
@@ -3832,7 +4004,7 @@ fn run_spike_word_lm(paths: &[&str]) -> Result<(), String> {
     println!();
     println!(
         "cooperative beam search: width={SPIKE_BEAM_WIDTH} cand_k={SPIKE_BEAM_CAND_K} \
-         n={SPIKE_LM_SAMPLE_WORDS}  (score = Σ_i log p_i)"
+         n={SPIKE_LM_SAMPLE_WORDS}  (score = Σ_i log p_i − α c(w)^β, α={SPIKE_BEAM_COVER_ALPHA} β={SPIKE_BEAM_COVER_BETA})"
     );
     let sample = ensemble.generate_beam(prompt, SPIKE_LM_SAMPLE_WORDS, SPIKE_BEAM_WIDTH);
     println!("sample cooperative-beam (prompt+{SPIKE_LM_SAMPLE_WORDS} words):");
@@ -3877,6 +4049,31 @@ fn run_spike_word_lm(paths: &[&str]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_simd_dot_f32_matches_scalar() {
+        // Length 48 matches typical SPIKE_LM_CTX_POOL / readout width.
+        let a: Vec<f32> = (0..48).map(|i| (i as f32) * 0.1 - 1.5).collect();
+        let b: Vec<f32> = (0..48).map(|i| (i as f32).sin() * 0.3).collect();
+        let simd = simd_dot_f32(&a, &b);
+        let scalar = dot_f32_scalar(&a, &b, 48);
+        assert!(
+            (simd - scalar).abs() < 1e-4,
+            "simd={simd} scalar={scalar}"
+        );
+        // Odd lengths / short tails.
+        for n in [1usize, 3, 7, 15, 17, 31, 33] {
+            let a: Vec<f32> = (0..n).map(|i| i as f32 + 0.25).collect();
+            let b: Vec<f32> = (0..n).map(|i| 2.0 - 0.1 * i as f32).collect();
+            let simd = simd_dot_f32(&a, &b);
+            let scalar = dot_f32_scalar(&a, &b, n);
+            assert!(
+                (simd - scalar).abs() < 1e-4,
+                "n={n} simd={simd} scalar={scalar}"
+            );
+        }
+        assert_eq!(simd_dot_f32(&[], &[]), 0.0);
+    }
 
     #[test]
     fn test_ring_buffer_chronological() {

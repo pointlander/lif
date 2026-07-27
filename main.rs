@@ -1165,18 +1165,14 @@ const SPIKE_LM_WOUT_CLIP: f32 = 2.5;
 const SPIKE_LM_TRAIN_FRAC: f32 = 0.9;
 /// Words to generate after the prompt.
 const SPIKE_LM_SAMPLE_WORDS: usize = 40;
-/// MCTS simulations per emitted word (more sims ⇒ deeper tree via expansion).
-const SPIKE_MCTS_SIMS: usize = 192;
-/// Expand only the top-k drive-policy actions at each MCTS node.
-const SPIKE_MCTS_TOP_K: usize = 14;
-/// PUCT exploration constant for spike-word MCTS.
-const SPIKE_MCTS_C_PUCT: f32 = 1.25;
-/// Stochastic rollout length (words) after expansion — main search depth signal.
-const SPIKE_MCTS_ROLLOUT: usize = 8;
-/// Softmax temperature on drive→prior for MCTS (<1 sharpens).
-const SPIKE_MCTS_POLICY_TEMP: f32 = 0.65;
-/// Log-prob penalty for immediately repeating a word.
-const SPIKE_MCTS_REPEAT_PENALTY: f32 = 0.85;
+/// Softmax temperature on drive→prior for policy / minimax branching.
+const SPIKE_POLICY_TEMP: f32 = 0.65;
+/// Minimax search depth (plies). Even depths end on maximizer-aligned leaves.
+const SPIKE_MINIMAX_DEPTH: usize = 2;
+/// Branching factor: top-k actions per model at each minimax node.
+const SPIKE_MINIMAX_TOP_K: usize = 8;
+/// Softmax temperature when sampling among near-tied minimax root actions (0 = greedy).
+const SPIKE_MINIMAX_ROOT_TEMP: f32 = 0.15;
 
 /// Keep printable ASCII + newline (maps curly quotes etc. away upstream).
 fn is_lm_byte(b: u8) -> bool {
@@ -3107,7 +3103,7 @@ impl SpikeWordLm {
     /// Softmax policy over generation drives from the context pool.
     fn gen_policy(&self) -> Vec<f32> {
         let drives = self.drives();
-        let t = SPIKE_MCTS_POLICY_TEMP.max(1e-3);
+        let t = SPIKE_POLICY_TEMP.max(1e-3);
         let mut max_d = f32::NEG_INFINITY;
         for &d in &drives {
             if d > max_d {
@@ -3139,187 +3135,11 @@ impl SpikeWordLm {
         idx
     }
 
-    fn sample_from_probs(&mut self, probs: &[f32], temperature: f32) -> usize {
-        if temperature <= 1e-6 {
-            return argmax_f32(probs);
-        }
-        let inv_t = 1.0 / temperature.max(1e-3);
-        let mut logits: Vec<f32> = probs
-            .iter()
-            .map(|p| p.max(1e-12).ln() * inv_t)
-            .collect();
-        let mut max = f32::NEG_INFINITY;
-        for &z in &logits {
-            if z > max {
-                max = z;
-            }
-        }
-        let mut sum = 0.0f32;
-        for z in &mut logits {
-            *z = (*z - max).exp();
-            sum += *z;
-        }
-        let inv = 1.0 / sum.max(1e-12);
-        for z in &mut logits {
-            *z *= inv;
-        }
-        let mut r = self.rng.u();
-        let mut pick = logits.len().saturating_sub(1);
-        for (i, &p) in logits.iter().enumerate() {
-            if r < p {
-                pick = i;
-                break;
-            }
-            r -= p;
-        }
-        pick
-    }
-
-    /// Log-prob of taking `act` under `probs`, with a mild anti-stutter penalty.
-    fn action_value_lp(&self, probs: &[f32], act: usize, last_word: usize) -> f32 {
-        let mut lp = probs.get(act).copied().unwrap_or(1e-12).max(1e-12).ln();
-        if act == last_word {
-            lp -= SPIKE_MCTS_REPEAT_PENALTY;
-        }
-        lp
-    }
-
-    /// Choose next word with **MCTS + PUCT** under the spike-drive policy.
-    ///
-    /// Prior at each state = softmax of generation drives (period-boosted).
-    /// State is the shared context pool + last word; branching snapshots and
-    /// restores pool membranes so real generation only commits the final pick.
-    fn mcts_select_word(&mut self, temperature: f32) -> usize {
-        let root_snap = self.snapshot_spike();
-        let root_prior = self.gen_policy();
-        let root_actions = Self::top_k_actions(&root_prior, SPIKE_MCTS_TOP_K);
-
-        let mut nodes: Vec<MctsNode> = vec![MctsNode {
-            action: 0,
-            prior: 1.0,
-            n: 0.0,
-            w: 0.0,
-            children: Vec::new(),
-            unexpanded: root_actions
-                .iter()
-                .map(|&a| (a, root_prior[a].max(MCTS_PRIOR_FLOOR)))
-                .collect(),
-        }];
-
-        for _ in 0..SPIKE_MCTS_SIMS {
-            self.restore_spike(&root_snap);
-            let mut path: Vec<usize> = vec![0];
-            let mut node = 0usize;
-            let mut path_logp = 0.0f32;
-            let mut cur_last = self.last_word;
-
-            // Selection: PUCT among expanded children.
-            while nodes[node].unexpanded.is_empty() && !nodes[node].children.is_empty() {
-                let parent_n = nodes[node].n.max(1.0);
-                let mut best_child = nodes[node].children[0];
-                let mut best_score = f32::NEG_INFINITY;
-                for &ch in &nodes[node].children {
-                    let c = &nodes[ch];
-                    let q = if c.n > 0.0 { c.w / c.n } else { 0.0 };
-                    let u = SPIKE_MCTS_C_PUCT * c.prior * parent_n.sqrt() / (1.0 + c.n);
-                    let score = q + u;
-                    if score > best_score {
-                        best_score = score;
-                        best_child = ch;
-                    }
-                }
-                let act = nodes[best_child].action;
-                let probs = self.gen_policy();
-                path_logp += self.action_value_lp(&probs, act, cur_last);
-                self.observe(act);
-                cur_last = act;
-                path.push(best_child);
-                node = best_child;
-            }
-
-            // Expansion: open one untried action (highest prior).
-            let mut first_step_lp = 0.0f32;
-            if !nodes[node].unexpanded.is_empty() {
-                let mut pick = 0usize;
-                let mut best_p = -1.0f32;
-                for (i, &(_, p)) in nodes[node].unexpanded.iter().enumerate() {
-                    if p > best_p {
-                        best_p = p;
-                        pick = i;
-                    }
-                }
-                let (act, prior) = nodes[node].unexpanded.swap_remove(pick);
-                let probs = self.gen_policy();
-                let lp = self.action_value_lp(&probs, act, cur_last);
-                if path.len() == 1 {
-                    first_step_lp = lp;
-                }
-                path_logp += lp;
-                self.observe(act);
-                cur_last = act;
-
-                let child_prior = self.gen_policy();
-                let child_actions = Self::top_k_actions(&child_prior, SPIKE_MCTS_TOP_K);
-                let child = nodes.len();
-                nodes.push(MctsNode {
-                    action: act,
-                    prior: prior.max(MCTS_PRIOR_FLOOR),
-                    n: 0.0,
-                    w: 0.0,
-                    children: Vec::new(),
-                    unexpanded: child_actions
-                        .iter()
-                        .map(|&a| (a, child_prior[a].max(MCTS_PRIOR_FLOOR)))
-                        .collect(),
-                });
-                nodes[node].children.push(child);
-                path.push(child);
-            }
-
-            // Short stochastic rollout under drive policy.
-            let mut rollout_logp = 0.0f32;
-            let roll_temp = temperature.clamp(0.45, 0.85);
-            for _ in 0..SPIKE_MCTS_ROLLOUT {
-                let probs = self.gen_policy();
-                let a = self.sample_from_probs(&probs, roll_temp);
-                rollout_logp += self.action_value_lp(&probs, a, cur_last);
-                self.observe(a);
-                cur_last = a;
-            }
-
-            let deep_steps = (path.len().saturating_sub(1) + SPIKE_MCTS_ROLLOUT).max(1) as f32;
-            let deep = (path_logp + rollout_logp) / deep_steps;
-            let value = if first_step_lp != 0.0 {
-                MCTS_IMMEDIATE_WEIGHT * first_step_lp
-                    + (1.0 - MCTS_IMMEDIATE_WEIGHT) * deep
-            } else {
-                deep
-            };
-
-            for &ni in path.iter().rev() {
-                nodes[ni].n += 1.0;
-                nodes[ni].w += value;
-            }
-        }
-
-        self.restore_spike(&root_snap);
-
-        if nodes[0].children.is_empty() {
-            return argmax_f32(&root_prior);
-        }
-        // Prefer most-visited child; break ties with Q and prior.
-        let mut best_a = nodes[nodes[0].children[0]].action;
-        let mut best_score = f32::NEG_INFINITY;
-        for &ch in &nodes[0].children {
-            let c = &nodes[ch];
-            let q = if c.n > 0.0 { c.w / c.n } else { f32::NEG_INFINITY };
-            let score = c.n + 0.35 * q + 0.5 * c.prior.ln();
-            if score > best_score {
-                best_score = score;
-                best_a = c.action;
-            }
-        }
-        best_a
+    /// Log-prob of a surface word under this model's current gen policy.
+    fn logp_of_word(&self, word: &str) -> f32 {
+        let id = self.vocab.encode(word);
+        let probs = self.gen_policy();
+        probs.get(id).copied().unwrap_or(1e-12).max(1e-12).ln()
     }
 
     /// One-step greedy/sampled emission (no tree search).
@@ -3340,38 +3160,290 @@ impl SpikeWordLm {
         }
         join_word_tokens(&out_words)
     }
-
-    /// Generate `n` words after `prompt` with **MCTS + PUCT** on spike drives.
-    ///
-    /// Each step runs [`SPIKE_MCTS_SIMS`] simulations. Prompt tokens are
-    /// teacher-forced into the context pool.
-    pub fn generate(&mut self, prompt: &str, n: usize, temperature: f32) -> String {
-        self.reset_state();
-        let prompt_tokens = tokenize_words(prompt.as_bytes());
-        let mut out_words: Vec<String> = if prompt_tokens.is_empty() {
-            vec!["the".to_string()]
-        } else {
-            prompt_tokens
-        };
-        for w in &out_words {
-            self.observe(self.vocab.encode(w));
-        }
-        for _ in 0..n {
-            let id = self.mcts_select_word(temperature);
-            self.observe(id);
-            out_words.push(self.vocab.decode(id).to_string());
-        }
-        join_word_tokens(&out_words)
-    }
 }
 
-/// Dynamics snapshot for spike-word MCTS (word bank + context pool + RNG).
+/// Dynamics snapshot for dual-model minimax branching.
 #[derive(Clone, Debug)]
 struct SpikeWordSnap {
     neurons: Vec<LifNeuron>,
     ctx: Vec<LifNeuron>,
     last_word: usize,
     rng_lfsr: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Dual spike-word LM: two-player minimax game (Shakespeare vs Bible)
+// ---------------------------------------------------------------------------
+
+/// Which agent is to move in the word-generation game.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpikePlayer {
+    /// Maximizer — chooses words to raise the zero-sum game value.
+    Shakespeare,
+    /// Minimizer — chooses words to lower the zero-sum game value.
+    Bible,
+}
+
+impl SpikePlayer {
+    fn other(self) -> Self {
+        match self {
+            SpikePlayer::Shakespeare => SpikePlayer::Bible,
+            SpikePlayer::Bible => SpikePlayer::Shakespeare,
+        }
+    }
+
+    fn is_maximizer(self) -> bool {
+        matches!(self, SpikePlayer::Shakespeare)
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            SpikePlayer::Shakespeare => "shakespeare",
+            SpikePlayer::Bible => "bible",
+        }
+    }
+}
+
+/// Two independently trained spike-word models that play a **zero-sum word game**.
+///
+/// ## Game rules
+/// - Shared board: the generated word sequence (both models observe every move).
+/// - **Player Shakespeare** (maximizer) moves on even turns: legal moves = top-k
+///   of the Shakespeare gen-policy; picks the move that maximizes game value.
+/// - **Player Bible** (minimizer) moves on odd turns: legal moves = top-k of the
+///   Bible gen-policy; picks the move that minimizes game value.
+/// - **Payoff** of playing surface word \(w\) (from maximizer's view):
+///   \(u(w)=\log p_{\mathrm{sh}}(w\mid\mathrm{ctx})-\log p_{\mathrm{bi}}(w\mid\mathrm{ctx})\).
+/// - Game value of a line is the sum of move payoffs; deeper plies are solved
+///   with perfect-information minimax (depth-limited).
+///
+/// Training of the two models is independent and runs in parallel.
+pub struct DualSpikeWordLm {
+    pub shakespeare: SpikeWordLm,
+    pub bible: SpikeWordLm,
+    rng: Rand,
+}
+
+impl DualSpikeWordLm {
+    pub fn new(shakespeare: SpikeWordLm, bible: SpikeWordLm, seed: u32) -> Self {
+        Self {
+            shakespeare,
+            bible,
+            rng: Rand::new(seed.max(1)),
+        }
+    }
+
+    pub fn reset_state(&mut self) {
+        self.shakespeare.reset_state();
+        self.bible.reset_state();
+    }
+
+    /// Apply a shared board move: both players observe the same surface word.
+    pub fn observe_word(&mut self, word: &str) {
+        let a = self.shakespeare.vocab.encode(word);
+        let b = self.bible.vocab.encode(word);
+        self.shakespeare.observe(a);
+        self.bible.observe(b);
+    }
+
+    /// Instantaneous zero-sum payoff of playing `word` in the current position
+    /// (before the move is applied). Maximizer wants this large; minimizer small.
+    fn move_payoff(sh: &SpikeWordLm, bi: &SpikeWordLm, word: &str) -> f32 {
+        sh.logp_of_word(word) - bi.logp_of_word(word)
+    }
+
+    /// Legal moves for the player to move: top-k under that player's policy.
+    fn legal_moves(sh: &SpikeWordLm, bi: &SpikeWordLm, player: SpikePlayer) -> Vec<String> {
+        let model = match player {
+            SpikePlayer::Shakespeare => sh,
+            SpikePlayer::Bible => bi,
+        };
+        let probs = model.gen_policy();
+        let ids = SpikeWordLm::top_k_actions(&probs, SPIKE_MINIMAX_TOP_K);
+        ids.into_iter()
+            .map(|id| model.vocab.decode(id).to_string())
+            .collect()
+    }
+
+    /// Depth-limited minimax from the position with `player` to move.
+    ///
+    /// Returns `(game_value, best_move)` where `game_value` is the maximizer's
+    /// (Shakespeare) utility of the subgame.
+    fn minimax(
+        sh: &mut SpikeWordLm,
+        bi: &mut SpikeWordLm,
+        player: SpikePlayer,
+        depth: usize,
+    ) -> (f32, Option<String>) {
+        // Terminal: no further plies — no remaining path payoff.
+        if depth == 0 {
+            return (0.0, None);
+        }
+
+        let moves = Self::legal_moves(sh, bi, player);
+        if moves.is_empty() {
+            return (0.0, None);
+        }
+
+        let snap_sh = sh.snapshot_spike();
+        let snap_bi = bi.snapshot_spike();
+        let maximizing = player.is_maximizer();
+
+        let mut best_move: Option<String> = None;
+        let mut best_val = if maximizing {
+            f32::NEG_INFINITY
+        } else {
+            f32::INFINITY
+        };
+
+        for word in &moves {
+            let pay = Self::move_payoff(sh, bi, word);
+            // Both agents update their board state with the shared token.
+            sh.observe(sh.vocab.encode(word));
+            bi.observe(bi.vocab.encode(word));
+            let (rest, _) = Self::minimax(sh, bi, player.other(), depth - 1);
+            let value = pay + rest;
+
+            sh.restore_spike(&snap_sh);
+            bi.restore_spike(&snap_bi);
+
+            let better = if maximizing {
+                value > best_val + 1e-9
+            } else {
+                value < best_val - 1e-9
+            };
+            if better || best_move.is_none() {
+                best_val = value;
+                best_move = Some(word.clone());
+            }
+        }
+
+        (best_val, best_move)
+    }
+
+    /// Choose the move for `player` by depth-limited minimax (optional soft root).
+    pub fn select_move(&mut self, player: SpikePlayer, temperature: f32) -> String {
+        let depth = SPIKE_MINIMAX_DEPTH.max(1);
+        let moves = Self::legal_moves(&self.shakespeare, &self.bible, player);
+        if moves.is_empty() {
+            return match player {
+                SpikePlayer::Shakespeare => "the".to_string(),
+                SpikePlayer::Bible => "And".to_string(),
+            };
+        }
+
+        let snap_sh = self.shakespeare.snapshot_spike();
+        let snap_bi = self.bible.snapshot_spike();
+        let maximizing = player.is_maximizer();
+
+        let mut scored: Vec<(String, f32)> = Vec::with_capacity(moves.len());
+        for word in &moves {
+            let pay = Self::move_payoff(&self.shakespeare, &self.bible, word);
+            self.shakespeare
+                .observe(self.shakespeare.vocab.encode(word));
+            self.bible.observe(self.bible.vocab.encode(word));
+            let (rest, _) =
+                Self::minimax(&mut self.shakespeare, &mut self.bible, player.other(), depth - 1);
+            scored.push((word.clone(), pay + rest));
+            self.shakespeare.restore_spike(&snap_sh);
+            self.bible.restore_spike(&snap_bi);
+        }
+        self.shakespeare.restore_spike(&snap_sh);
+        self.bible.restore_spike(&snap_bi);
+
+        // Greedy perfect play at the root (or soft-max over values).
+        let t = temperature.max(0.0);
+        if t <= 1e-3 {
+            return if maximizing {
+                scored
+                    .into_iter()
+                    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            } else {
+                scored
+                    .into_iter()
+                    .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            }
+            .map(|(w, _)| w)
+            .unwrap_or_else(|| "the".to_string());
+        }
+
+        // Softmax over ±value so maximizer prefers high, minimizer prefers low.
+        let signed: Vec<f32> = scored
+            .iter()
+            .map(|(_, v)| if maximizing { *v } else { -*v })
+            .collect();
+        let mut max_s = f32::NEG_INFINITY;
+        for &s in &signed {
+            if s > max_s {
+                max_s = s;
+            }
+        }
+        let t = t.max(SPIKE_MINIMAX_ROOT_TEMP);
+        let mut weights = Vec::with_capacity(signed.len());
+        let mut sum = 0.0f32;
+        for &s in &signed {
+            let w = ((s - max_s) / t).exp();
+            weights.push(w);
+            sum += w;
+        }
+        let r = self.rng.u() * sum.max(1e-12);
+        let mut acc = 0.0f32;
+        for (i, &w) in weights.iter().enumerate() {
+            acc += w;
+            if r <= acc {
+                return scored[i].0.clone();
+            }
+        }
+        scored
+            .last()
+            .map(|(w, _)| w.clone())
+            .unwrap_or_else(|| "the".to_string())
+    }
+
+    /// Play `n` moves of the two-player game after priming on `prompt`.
+    ///
+    /// Turn order: Shakespeare (max), Bible (min), Shakespeare, …
+    /// Returns the full transcript; optional `trace` records who played each move.
+    pub fn generate(&mut self, prompt: &str, n: usize, temperature: f32) -> String {
+        self.generate_game(prompt, n, temperature, false).0
+    }
+
+    /// Like [`generate`], but can print a per-move player trace.
+    pub fn generate_game(
+        &mut self,
+        prompt: &str,
+        n: usize,
+        temperature: f32,
+        verbose: bool,
+    ) -> (String, Vec<(SpikePlayer, String)>) {
+        self.reset_state();
+        let prompt_tokens = tokenize_words(prompt.as_bytes());
+        let mut out_words: Vec<String> = if prompt_tokens.is_empty() {
+            vec!["To".to_string()]
+        } else {
+            prompt_tokens
+        };
+        for w in &out_words {
+            self.observe_word(w);
+        }
+
+        let mut moves: Vec<(SpikePlayer, String)> = Vec::with_capacity(n);
+        for i in 0..n {
+            let player = if i % 2 == 0 {
+                SpikePlayer::Shakespeare
+            } else {
+                SpikePlayer::Bible
+            };
+            let word = self.select_move(player, temperature);
+            if verbose {
+                println!("  move {i}: {} plays «{word}»", player.name());
+            }
+            self.observe_word(&word);
+            moves.push((player, word.clone()));
+            out_words.push(word);
+        }
+        (join_word_tokens(&out_words), moves)
+    }
 }
 
 /// Join word tokens with spaces, attaching single-char punctuation without a
@@ -3476,117 +3548,163 @@ fn load_tokenized_sources(paths: &[&str]) -> Result<Vec<(String, Vec<String>)>, 
     Ok(out)
 }
 
-/// Per source: first [`SPIKE_LM_TRAIN_FRAC`] of tokens → train, remainder → validation.
-/// Streams are concatenated in path order (Shakespeare then Bible, etc.).
-fn split_sources_train_eval(
-    sources: &[(String, Vec<String>)],
-    train_frac: f32,
-) -> (Vec<String>, Vec<String>, Vec<(String, usize, usize, usize)>) {
+/// First [`SPIKE_LM_TRAIN_FRAC`] of tokens → train, remainder → validation.
+fn split_one_source(toks: &[String], train_frac: f32) -> (Vec<String>, Vec<String>) {
     let frac = train_frac.clamp(0.05, 0.99);
-    let mut train_toks = Vec::new();
-    let mut eval_toks = Vec::new();
-    let mut per_source = Vec::new();
-    for (path, toks) in sources {
-        let n = toks.len();
-        // At least one train and one eval token when the source is large enough.
-        let mut t_end = ((n as f32) * frac).floor() as usize;
-        if n >= 2 {
-            t_end = t_end.clamp(1, n - 1);
-        } else {
-            t_end = n;
-        }
-        let train_n = t_end;
-        let eval_n = n.saturating_sub(t_end);
-        if train_n > 0 {
-            train_toks.extend_from_slice(&toks[..t_end]);
-        }
-        if eval_n > 0 {
-            eval_toks.extend_from_slice(&toks[t_end..]);
-        }
-        per_source.push((path.clone(), n, train_n, eval_n));
+    let n = toks.len();
+    let mut t_end = ((n as f32) * frac).floor() as usize;
+    if n >= 2 {
+        t_end = t_end.clamp(1, n - 1);
+    } else {
+        t_end = n;
     }
-    (train_toks, eval_toks, per_source)
+    let train = toks[..t_end].to_vec();
+    let eval = toks[t_end..].to_vec();
+    (train, eval)
 }
 
-/// Spike-emission word LM: one [`LifNeuron`] per word; a spike emits that word.
+/// Train a single-source spike model (vocab + neurons private to that source).
+fn train_spike_model_on_tokens(
+    name: &str,
+    train_toks: &[String],
+    eval_toks: &[String],
+    seed: u32,
+    hebb_epochs: usize,
+) -> (SpikeWordLm, LmTrainStats, LmTrainStats) {
+    let vocab = WordVocab::from_tokens(train_toks);
+    let train_ids = vocab.encode_tokens(train_toks);
+    let eval_ids = vocab.encode_tokens(eval_toks);
+    println!(
+        "  [{name}] train={} valid={} vocab={} neurons={}",
+        train_ids.len(),
+        eval_ids.len(),
+        vocab.len(),
+        vocab.len()
+    );
+    let mut model = SpikeWordLm::new(vocab, seed);
+    let train_stats = model.train_ids(&train_ids, hebb_epochs);
+    let eval_stats = model.evaluate_ids(&eval_ids);
+    println!(
+        "  [{name}] train acc={:.3} ppl={:.2} | valid acc={:.3} ppl={:.2}",
+        train_stats.accuracy,
+        train_stats.perplexity,
+        eval_stats.accuracy,
+        eval_stats.perplexity
+    );
+    (model, train_stats, eval_stats)
+}
+
+/// Dual spike-word LMs (Shakespeare + Bible), parallel train, minimax decode.
 fn run_spike_word_lm(paths: &[&str]) -> Result<(), String> {
     println!();
-    println!("=== Spike-word LM (LifNeuron per word; fire ⇒ emit) ===");
+    println!("=== Dual spike-word LM (Shakespeare ∥ Bible; minimax decode) ===");
     println!(
-        "corpus: {}  (train={:.0}% / valid={:.0}% per source)",
+        "corpus: {}  (train={:.0}% / valid={:.0}% per source, parallel train)",
         paths.join(" + "),
         SPIKE_LM_TRAIN_FRAC * 100.0,
         (1.0 - SPIKE_LM_TRAIN_FRAC) * 100.0
     );
 
     let sources = load_tokenized_sources(paths)?;
-    let (train_toks, eval_toks, per_source) =
-        split_sources_train_eval(&sources, SPIKE_LM_TRAIN_FRAC);
-    let corpus_tokens: usize = per_source.iter().map(|s| s.1).sum();
-    for (path, total, train_n, eval_n) in &per_source {
-        println!("  {path}: tokens={total} train={train_n} valid={eval_n}");
-    }
-    if train_toks.len() < 128 {
-        return Err(format!(
-            "word stream too short for training ({} tokens)",
-            train_toks.len()
-        ));
-    }
-    if eval_toks.is_empty() {
-        return Err("validation split is empty".into());
+    if sources.len() < 2 {
+        return Err(
+            "dual spike LM needs at least two corpus paths (Shakespeare + Bible)".into(),
+        );
     }
 
-    // Vocab = unique words in the **train** slices of every source (+ `<unk>`).
-    // Because each source contributes 90%, Bible types are included.
-    let vocab = WordVocab::from_tokens(&train_toks);
-    let train_ids = vocab.encode_tokens(&train_toks);
-    let eval_ids = vocab.encode_tokens(&eval_toks);
-    let n_unique = vocab.len().saturating_sub(1); // exclude <unk>
+    // Map paths: prefer 100.* as Shakespeare, 10.* as Bible; else order given.
+    let mut sh_src: Option<(String, Vec<String>)> = None;
+    let mut bi_src: Option<(String, Vec<String>)> = None;
+    for (path, toks) in sources {
+        let base = path.rsplit('/').next().unwrap_or(path.as_str());
+        if base.starts_with("100") || path.contains("100.txt") {
+            sh_src = Some((path, toks));
+        } else if base.starts_with("10") || path.contains("10.txt") {
+            bi_src = Some((path, toks));
+        } else if sh_src.is_none() {
+            sh_src = Some((path, toks));
+        } else {
+            bi_src = Some((path, toks));
+        }
+    }
+    let (sh_path, sh_toks) = sh_src.ok_or_else(|| "missing Shakespeare corpus".to_string())?;
+    let (bi_path, bi_toks) = bi_src.ok_or_else(|| "missing Bible corpus".to_string())?;
+
+    let (sh_train, sh_eval) = split_one_source(&sh_toks, SPIKE_LM_TRAIN_FRAC);
+    let (bi_train, bi_eval) = split_one_source(&bi_toks, SPIKE_LM_TRAIN_FRAC);
+    println!(
+        "  {sh_path}: tokens={} train={} valid={}",
+        sh_toks.len(),
+        sh_train.len(),
+        sh_eval.len()
+    );
+    println!(
+        "  {bi_path}: tokens={} train={} valid={}",
+        bi_toks.len(),
+        bi_train.len(),
+        bi_eval.len()
+    );
+    if sh_train.len() < 128 || bi_train.len() < 128 {
+        return Err("train split too short for one of the sources".into());
+    }
 
     println!(
-        "words: corpus_tokens={} train={} valid={} unique={} vocab={} word_neurons={} ctx_pool={} hebb_cap={} mcts_sims={}",
-        corpus_tokens,
-        train_ids.len(),
-        eval_ids.len(),
-        n_unique,
-        vocab.len(),
-        vocab.len(),
-        SPIKE_LM_CTX_POOL,
-        SPIKE_LM_HEBB_TOKENS,
-        SPIKE_MCTS_SIMS
+        "training both models in parallel (hebb_cap={SPIKE_LM_HEBB_TOKENS}, ctx_pool={SPIKE_LM_CTX_POOL})..."
     );
 
-    let mut model = SpikeWordLm::new(vocab, 0x51A6E);
-    let train_stats = model.train_ids(&train_ids, 1);
+    // Parallel train: each model owns its vocab / weights / pool.
+    let (sh_pack, bi_pack) = std::thread::scope(|scope| {
+        let sh_h = scope.spawn(|| {
+            train_spike_model_on_tokens("shakespeare", &sh_train, &sh_eval, 0x51A6E, 1)
+        });
+        let bi_h = scope.spawn(|| {
+            train_spike_model_on_tokens("bible", &bi_train, &bi_eval, 0xB1B1E, 1)
+        });
+        (
+            sh_h.join().expect("shakespeare train thread"),
+            bi_h.join().expect("bible train thread"),
+        )
+    });
+
+    let (shakespeare, sh_train_stats, sh_eval_stats) = sh_pack;
+    let (bible, bi_train_stats, bi_eval_stats) = bi_pack;
+
     println!(
-        "train (word n-gram synapses + Hebb≤{SPIKE_LM_HEBB_TOKENS}): tokens={}  acc={:.3}  nll={:.3}  ppl={:.2}",
-        train_stats.tokens, train_stats.accuracy, train_stats.loss, train_stats.perplexity
+        "shakespeare neurons={} | bible neurons={}",
+        shakespeare.n_words(),
+        bible.n_words()
     );
 
-    let eval_stats = model.evaluate_ids(&eval_ids);
-    println!(
-        "eval (spike emit word): tokens={}  acc={:.3}  nll={:.3}  ppl={:.2}",
-        eval_stats.tokens, eval_stats.accuracy, eval_stats.loss, eval_stats.perplexity
-    );
-
+    let mut dual = DualSpikeWordLm::new(shakespeare, bible, 0xD0A1);
     let prompt = "To be, or not to be";
     println!();
     println!(
-        "spike-MCTS generate: sims={SPIKE_MCTS_SIMS} top_k={SPIKE_MCTS_TOP_K} rollout={SPIKE_MCTS_ROLLOUT} \
-         c_puct={SPIKE_MCTS_C_PUCT} n={SPIKE_LM_SAMPLE_WORDS}"
+        "two-player minimax game: depth={SPIKE_MINIMAX_DEPTH} top_k={SPIKE_MINIMAX_TOP_K} \
+         n={SPIKE_LM_SAMPLE_WORDS}  (Shakespeare=MAX, Bible=MIN, alternate turns)"
     );
-    let sample = model.generate(prompt, SPIKE_LM_SAMPLE_WORDS, 0.7);
-    println!("sample spike-MCTS (temp=0.7, prompt+{SPIKE_LM_SAMPLE_WORDS} words):");
+    let (sample, move_trace) =
+        dual.generate_game(prompt, SPIKE_LM_SAMPLE_WORDS, 0.0, false);
+    println!("sample game transcript (prompt+{SPIKE_LM_SAMPLE_WORDS} plies):");
     println!("----");
     println!("{sample}");
     println!("----");
+    print!("move order: ");
+    for (i, (player, w)) in move_trace.iter().enumerate() {
+        if i > 0 {
+            print!(" | ");
+        }
+        print!("{}:{}", player.name(), w);
+    }
+    println!();
     println!(
-        "{{spike_word_lm: {{\"train_acc\": {:.6}, \"eval_acc\": {:.6}, \"eval_ppl\": {:.4}, \"neurons\": {}, \"mcts_sims\": {}}}}}",
-        train_stats.accuracy,
-        eval_stats.accuracy,
-        eval_stats.perplexity,
-        model.n_words(),
-        SPIKE_MCTS_SIMS
+        "{{spike_word_lm: {{\"sh_train_acc\": {:.6}, \"sh_eval_acc\": {:.6}, \"bi_train_acc\": {:.6}, \"bi_eval_acc\": {:.6}, \"sh_neurons\": {}, \"bi_neurons\": {}, \"minimax_depth\": {}, \"game\": \"sh_max_vs_bi_min\"}}}}",
+        sh_train_stats.accuracy,
+        sh_eval_stats.accuracy,
+        bi_train_stats.accuracy,
+        bi_eval_stats.accuracy,
+        dual.shakespeare.n_words(),
+        dual.bible.n_words(),
+        SPIKE_MINIMAX_DEPTH
     );
     Ok(())
 }
@@ -4079,10 +4197,21 @@ mod tests {
         let sample_toks = tokenize_words(sample.as_bytes());
         assert!(sample_toks.len() >= 5);
 
-        // Short MCTS sample exercises search + pool snapshots.
-        let mcts_sample = model.generate("cat", 4, 0.5);
-        assert!(mcts_sample.split_whitespace().count() >= 3);
-        assert!(std::str::from_utf8(mcts_sample.as_bytes()).is_ok());
+        // Two-player minimax game with two small models (alternate turns).
+        let text2 = "cat dog fish cat dog fish cat dog fish cat dog fish ";
+        let toks2 = tokenize_words(text2.as_bytes());
+        let vocab2 = WordVocab::from_tokens(&toks2);
+        let ids2 = vocab2.encode_tokens(&toks2);
+        let mut m2 = SpikeWordLm::new(vocab2, 7);
+        let _ = m2.train_ids(&ids2, 0);
+        let mut dual = DualSpikeWordLm::new(model, m2, 3);
+        let (mm, trace) = dual.generate_game("cat", 4, 0.0, false);
+        assert!(mm.split_whitespace().count() >= 3);
+        assert_eq!(trace.len(), 4);
+        assert_eq!(trace[0].0, SpikePlayer::Shakespeare);
+        assert_eq!(trace[1].0, SpikePlayer::Bible);
+        assert_eq!(trace[2].0, SpikePlayer::Shakespeare);
+        assert_eq!(trace[3].0, SpikePlayer::Bible);
     }
 
     #[test]
@@ -4121,9 +4250,6 @@ mod tests {
             uniq.len() >= 3,
             "degenerate sample: {sample:?}"
         );
-        // MCTS path (few words) on a warm pool after direct gen.
-        let mcts = model.generate("to be", 3, 0.6);
-        assert!(mcts.split_whitespace().count() >= 3);
     }
 
     #[test]
@@ -4204,39 +4330,32 @@ mod tests {
     }
 
     #[test]
-    fn test_spike_word_vocab_includes_both_sources() {
+    fn test_dual_source_split_and_separate_vocabs() {
         let sources = load_tokenized_sources(LM_CORPUS_PATHS).expect("sources");
         assert_eq!(sources.len(), 2);
-        let (train_toks, eval_toks, per) = split_sources_train_eval(&sources, SPIKE_LM_TRAIN_FRAC);
-        // Each source contributes ~90% train / ~10% valid.
-        for (path, total, train_n, eval_n) in &per {
-            assert_eq!(train_n + eval_n, *total, "{path}");
-            let frac = *train_n as f32 / *total as f32;
+        let mut saw_bible_vocab = false;
+        let mut saw_sh_vocab = false;
+        for (path, toks) in &sources {
+            let (train, eval) = split_one_source(toks, SPIKE_LM_TRAIN_FRAC);
+            assert_eq!(train.len() + eval.len(), toks.len(), "{path}");
+            let frac = train.len() as f32 / toks.len() as f32;
             assert!(
                 (frac - SPIKE_LM_TRAIN_FRAC).abs() < 0.02,
-                "{path}: train frac {frac} not near {}",
-                SPIKE_LM_TRAIN_FRAC
+                "{path}: train frac {frac}"
             );
-            assert!(*eval_n > 0, "{path}: empty validation");
+            let vocab = WordVocab::from_tokens(&train);
+            if path.contains("10.txt") {
+                saw_bible_vocab = ["LORD", "God", "Genesis", "Israel", "Moses"]
+                    .iter()
+                    .any(|w| vocab.encode(w) != vocab.unk_id());
+            }
+            if path.contains("100.txt") {
+                saw_sh_vocab = vocab.encode("the") != vocab.unk_id()
+                    || vocab.encode("The") != vocab.unk_id();
+            }
         }
-        assert!(!train_toks.is_empty() && !eval_toks.is_empty());
-
-        let vocab = WordVocab::from_tokens(&train_toks);
-        // Shakespeare + Bible train slices both feed the vocab.
-        assert_ne!(vocab.encode("the"), vocab.unk_id());
-        assert_ne!(
-            vocab.encode("God"),
-            vocab.unk_id(),
-            "Bible train slice should put 'God' in WordVocab"
-        );
-        // Case-sensitive: common Bible form
-        let has_bible_type = ["LORD", "God", "Genesis", "Israel", "Moses"]
-            .iter()
-            .any(|w| vocab.encode(w) != vocab.unk_id());
-        assert!(
-            has_bible_type,
-            "expected at least one Bible type in train vocab"
-        );
+        assert!(saw_bible_vocab, "Bible train vocab should include Bible types");
+        assert!(saw_sh_vocab, "Shakespeare train vocab should include common words");
     }
 }
 

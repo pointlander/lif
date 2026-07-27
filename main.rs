@@ -1068,8 +1068,10 @@ const LM_BLOCK_SIZE: usize = 24;
 /// Project ensemble membranes to this dim before forming the adjacency Gram
 /// (keeps RF feature size manageable: K(K+1)/2 + K).
 const LM_ADJ_PROJ: usize = 12;
-/// Default training path (Project Gutenberg Shakespeare, eBook #100).
+/// Default single-file corpus (Shakespeare, Project Gutenberg eBook #100).
 const LM_CORPUS_PATH: &str = "100.txt.utf-8";
+/// Training corpora concatenated for character + spike-word LMs.
+const LM_CORPUS_PATHS: &[&str] = &["100.txt.utf-8", "10.txt.utf-8"];
 /// Characters used when streaming the reservoir for RF feature collection.
 const LM_TRAIN_CHARS: usize = 700_000;
 /// Held-out window immediately after the train prefix.
@@ -1159,11 +1161,8 @@ const SPIKE_LM_HEBB_TOKENS: usize = 60_000;
 const SPIKE_LM_ACC_STRIDE: usize = 2;
 /// Clamp on learned pool→word weights.
 const SPIKE_LM_WOUT_CLIP: f32 = 2.5;
-/// Word tokens used for training (from the start of the tokenized corpus).
-/// Vocab size = number of unique words in this train slice (+ `<unk>`).
-const SPIKE_LM_TRAIN_WORDS: usize = 100_000;
-/// Held-out word window after the train prefix.
-const SPIKE_LM_EVAL_WORDS: usize = 6_000;
+/// Fraction of each corpus file's tokens used for training (rest = validation).
+const SPIKE_LM_TRAIN_FRAC: f32 = 0.9;
 /// Words to generate after the prompt.
 const SPIKE_LM_SAMPLE_WORDS: usize = 40;
 /// MCTS simulations per emitted word (more sims ⇒ deeper tree via expansion).
@@ -1374,6 +1373,32 @@ fn load_corpus(path: &str) -> Result<Vec<u8>, String> {
         return Err(format!("{path} too short ({} bytes)", out.len()));
     }
     Ok(out)
+}
+
+/// Load and concatenate multiple corpora (joined with a newline separator).
+fn load_corpora(paths: &[&str]) -> Result<Vec<u8>, String> {
+    if paths.is_empty() {
+        return Err("no corpus paths provided".into());
+    }
+    let mut all = Vec::new();
+    for &path in paths {
+        let part = load_corpus(path)?;
+        if !all.is_empty() {
+            if all.last().copied() != Some(b'\n') {
+                all.push(b'\n');
+            }
+            all.push(b'\n');
+        }
+        all.extend_from_slice(&part);
+    }
+    if all.len() < 64 {
+        return Err(format!(
+            "combined corpora too short ({} bytes from {} files)",
+            all.len(),
+            paths.len()
+        ));
+    }
+    Ok(all)
 }
 
 #[derive(Clone, Debug)]
@@ -3368,13 +3393,13 @@ fn join_word_tokens(words: &[String]) -> String {
     s
 }
 
-/// Train + evaluate + sample from `100.txt.utf-8` (or a provided path).
-fn run_language_model(path: &str) -> Result<(), String> {
+/// Train + evaluate + sample from one or more corpus paths.
+fn run_language_model(paths: &[&str]) -> Result<(), String> {
     println!();
     println!("=== LifEnsemble block-adjacency LM (RF readout) ===");
-    println!("corpus: {path}");
+    println!("corpus: {}", paths.join(" + "));
 
-    let corpus = load_corpus(path)?;
+    let corpus = load_corpora(paths)?;
     let train_end = LM_TRAIN_CHARS.min(corpus.len().saturating_sub(LM_EVAL_CHARS + 2));
     let eval_end = (train_end + LM_EVAL_CHARS).min(corpus.len());
     if train_end < 1024 {
@@ -3434,40 +3459,93 @@ fn run_language_model(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Tokenize each corpus path separately (preserves per-source boundaries).
+fn load_tokenized_sources(paths: &[&str]) -> Result<Vec<(String, Vec<String>)>, String> {
+    let mut out = Vec::with_capacity(paths.len());
+    for &path in paths {
+        let bytes = load_corpus(path)?;
+        let toks = tokenize_words(&bytes);
+        if toks.len() < 64 {
+            return Err(format!("{path}: too few word tokens ({})", toks.len()));
+        }
+        out.push((path.to_string(), toks));
+    }
+    if out.is_empty() {
+        return Err("no corpus paths provided".into());
+    }
+    Ok(out)
+}
+
+/// Per source: first [`SPIKE_LM_TRAIN_FRAC`] of tokens → train, remainder → validation.
+/// Streams are concatenated in path order (Shakespeare then Bible, etc.).
+fn split_sources_train_eval(
+    sources: &[(String, Vec<String>)],
+    train_frac: f32,
+) -> (Vec<String>, Vec<String>, Vec<(String, usize, usize, usize)>) {
+    let frac = train_frac.clamp(0.05, 0.99);
+    let mut train_toks = Vec::new();
+    let mut eval_toks = Vec::new();
+    let mut per_source = Vec::new();
+    for (path, toks) in sources {
+        let n = toks.len();
+        // At least one train and one eval token when the source is large enough.
+        let mut t_end = ((n as f32) * frac).floor() as usize;
+        if n >= 2 {
+            t_end = t_end.clamp(1, n - 1);
+        } else {
+            t_end = n;
+        }
+        let train_n = t_end;
+        let eval_n = n.saturating_sub(t_end);
+        if train_n > 0 {
+            train_toks.extend_from_slice(&toks[..t_end]);
+        }
+        if eval_n > 0 {
+            eval_toks.extend_from_slice(&toks[t_end..]);
+        }
+        per_source.push((path.clone(), n, train_n, eval_n));
+    }
+    (train_toks, eval_toks, per_source)
+}
+
 /// Spike-emission word LM: one [`LifNeuron`] per word; a spike emits that word.
-fn run_spike_word_lm(path: &str) -> Result<(), String> {
+fn run_spike_word_lm(paths: &[&str]) -> Result<(), String> {
     println!();
     println!("=== Spike-word LM (LifNeuron per word; fire ⇒ emit) ===");
-    println!("corpus: {path}");
+    println!(
+        "corpus: {}  (train={:.0}% / valid={:.0}% per source)",
+        paths.join(" + "),
+        SPIKE_LM_TRAIN_FRAC * 100.0,
+        (1.0 - SPIKE_LM_TRAIN_FRAC) * 100.0
+    );
 
-    let corpus = load_corpus(path)?;
-    let all_tokens = tokenize_words(&corpus);
-    if all_tokens.len() < 256 {
+    let sources = load_tokenized_sources(paths)?;
+    let (train_toks, eval_toks, per_source) =
+        split_sources_train_eval(&sources, SPIKE_LM_TRAIN_FRAC);
+    let corpus_tokens: usize = per_source.iter().map(|s| s.1).sum();
+    for (path, total, train_n, eval_n) in &per_source {
+        println!("  {path}: tokens={total} train={train_n} valid={eval_n}");
+    }
+    if train_toks.len() < 128 {
         return Err(format!(
-            "too few word tokens after tokenize ({})",
-            all_tokens.len()
+            "word stream too short for training ({} tokens)",
+            train_toks.len()
         ));
     }
-    let train_end = SPIKE_LM_TRAIN_WORDS.min(all_tokens.len().saturating_sub(SPIKE_LM_EVAL_WORDS + 2));
-    let eval_end = (train_end + SPIKE_LM_EVAL_WORDS).min(all_tokens.len());
-    if train_end < 128 {
-        return Err(format!(
-            "word stream too short for train/eval split ({} tokens)",
-            all_tokens.len()
-        ));
+    if eval_toks.is_empty() {
+        return Err("validation split is empty".into());
     }
-    let train_toks = &all_tokens[..train_end];
-    let eval_toks = &all_tokens[train_end..eval_end];
 
-    // Vocab = every unique train word (+ `<unk>`); each word owns one neuron.
-    let vocab = WordVocab::from_tokens(train_toks);
-    let train_ids = vocab.encode_tokens(train_toks);
-    let eval_ids = vocab.encode_tokens(eval_toks);
+    // Vocab = unique words in the **train** slices of every source (+ `<unk>`).
+    // Because each source contributes 90%, Bible types are included.
+    let vocab = WordVocab::from_tokens(&train_toks);
+    let train_ids = vocab.encode_tokens(&train_toks);
+    let eval_ids = vocab.encode_tokens(&eval_toks);
     let n_unique = vocab.len().saturating_sub(1); // exclude <unk>
 
     println!(
-        "words: corpus_tokens={} train={} eval={} unique={} vocab={} word_neurons={} ctx_pool={} hebb_cap={} max_ticks={}",
-        all_tokens.len(),
+        "words: corpus_tokens={} train={} valid={} unique={} vocab={} word_neurons={} ctx_pool={} hebb_cap={} mcts_sims={}",
+        corpus_tokens,
         train_ids.len(),
         eval_ids.len(),
         n_unique,
@@ -3475,7 +3553,7 @@ fn run_spike_word_lm(path: &str) -> Result<(), String> {
         vocab.len(),
         SPIKE_LM_CTX_POOL,
         SPIKE_LM_HEBB_TOKENS,
-        SPIKE_LM_MAX_TICKS
+        SPIKE_MCTS_SIMS
     );
 
     let mut model = SpikeWordLm::new(vocab, 0x51A6E);
@@ -4108,6 +4186,58 @@ mod tests {
         let vocab = CharVocab::from_bytes(&corpus[..50_000]);
         assert!(vocab.len() > 40 && vocab.len() < 200);
     }
+
+    #[test]
+    fn test_load_combined_corpora_includes_bible() {
+        let combined = load_corpora(LM_CORPUS_PATHS).expect("100 + 10 corpora should load");
+        let shakespeare = load_corpus("100.txt.utf-8").expect("100.txt.utf-8");
+        let bible = load_corpus("10.txt.utf-8").expect("10.txt.utf-8");
+        assert!(combined.len() > shakespeare.len());
+        assert!(combined.len() >= shakespeare.len() + bible.len());
+        assert!(!combined.contains(&b'\r'));
+        // Spot-check that Bible content survived tokenization/normalization.
+        let as_str = String::from_utf8_lossy(&combined);
+        assert!(
+            as_str.contains("Bible") || as_str.contains("Genesis") || as_str.contains("God"),
+            "expected Bible corpus markers in combined training data"
+        );
+    }
+
+    #[test]
+    fn test_spike_word_vocab_includes_both_sources() {
+        let sources = load_tokenized_sources(LM_CORPUS_PATHS).expect("sources");
+        assert_eq!(sources.len(), 2);
+        let (train_toks, eval_toks, per) = split_sources_train_eval(&sources, SPIKE_LM_TRAIN_FRAC);
+        // Each source contributes ~90% train / ~10% valid.
+        for (path, total, train_n, eval_n) in &per {
+            assert_eq!(train_n + eval_n, *total, "{path}");
+            let frac = *train_n as f32 / *total as f32;
+            assert!(
+                (frac - SPIKE_LM_TRAIN_FRAC).abs() < 0.02,
+                "{path}: train frac {frac} not near {}",
+                SPIKE_LM_TRAIN_FRAC
+            );
+            assert!(*eval_n > 0, "{path}: empty validation");
+        }
+        assert!(!train_toks.is_empty() && !eval_toks.is_empty());
+
+        let vocab = WordVocab::from_tokens(&train_toks);
+        // Shakespeare + Bible train slices both feed the vocab.
+        assert_ne!(vocab.encode("the"), vocab.unk_id());
+        assert_ne!(
+            vocab.encode("God"),
+            vocab.unk_id(),
+            "Bible train slice should put 'God' in WordVocab"
+        );
+        // Case-sensitive: common Bible form
+        let has_bible_type = ["LORD", "God", "Genesis", "Israel", "Moses"]
+            .iter()
+            .any(|w| vocab.encode(w) != vocab.unk_id());
+        assert!(
+            has_bible_type,
+            "expected at least one Bible type in train vocab"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4517,14 +4647,14 @@ fn main() {
     }
 
     if flags.language_model {
-        if let Err(e) = run_language_model(LM_CORPUS_PATH) {
+        if let Err(e) = run_language_model(LM_CORPUS_PATHS) {
             eprintln!("language model error: {e}");
             std::process::exit(1);
         }
     }
 
     if flags.spike_word {
-        if let Err(e) = run_spike_word_lm(LM_CORPUS_PATH) {
+        if let Err(e) = run_spike_word_lm(LM_CORPUS_PATHS) {
             eprintln!("spike-word language model error: {e}");
             std::process::exit(1);
         }

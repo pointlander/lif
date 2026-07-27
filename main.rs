@@ -1070,8 +1070,9 @@ const LM_BLOCK_SIZE: usize = 24;
 const LM_ADJ_PROJ: usize = 12;
 /// Default single-file corpus (Shakespeare, Project Gutenberg eBook #100).
 const LM_CORPUS_PATH: &str = "100.txt.utf-8";
-/// Training corpora concatenated for character + spike-word LMs.
-const LM_CORPUS_PATHS: &[&str] = &["100.txt.utf-8", "10.txt.utf-8"];
+/// Training corpora for character LM (concat) and dual spike (per-source models).
+/// 100 = Shakespeare, 10 = KJV Bible, 1727 = Odyssey (Project Gutenberg).
+const LM_CORPUS_PATHS: &[&str] = &["100.txt.utf-8", "10.txt.utf-8", "1727.txt.utf-8"];
 /// Characters used when streaming the reservoir for RF feature collection.
 const LM_TRAIN_CHARS: usize = 700_000;
 /// Held-out window immediately after the train prefix.
@@ -3172,92 +3173,124 @@ struct SpikeWordSnap {
 }
 
 // ---------------------------------------------------------------------------
-// Dual spike-word LM: two-player minimax game (Shakespeare vs Bible)
+// Multi-player spike-word game (Shakespeare, Bible, Odyssey) via maxⁿ
 // ---------------------------------------------------------------------------
 
-/// Which agent is to move in the word-generation game.
+/// Number of agents in the word game (Shakespeare, Bible, Odyssey).
+const SPIKE_N_PLAYERS: usize = 3;
+
+/// Which agent is to move (index into the triple of models).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpikePlayer {
-    /// Maximizer — chooses words to raise the zero-sum game value.
-    Shakespeare,
-    /// Minimizer — chooses words to lower the zero-sum game value.
-    Bible,
+    Shakespeare = 0,
+    Bible = 1,
+    Odyssey = 2,
 }
 
 impl SpikePlayer {
-    fn other(self) -> Self {
-        match self {
-            SpikePlayer::Shakespeare => SpikePlayer::Bible,
-            SpikePlayer::Bible => SpikePlayer::Shakespeare,
+    fn from_index(i: usize) -> Self {
+        match i % SPIKE_N_PLAYERS {
+            0 => SpikePlayer::Shakespeare,
+            1 => SpikePlayer::Bible,
+            _ => SpikePlayer::Odyssey,
         }
     }
 
-    fn is_maximizer(self) -> bool {
-        matches!(self, SpikePlayer::Shakespeare)
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    fn next(self) -> Self {
+        Self::from_index(self.index() + 1)
     }
 
     fn name(self) -> &'static str {
         match self {
             SpikePlayer::Shakespeare => "shakespeare",
             SpikePlayer::Bible => "bible",
+            SpikePlayer::Odyssey => "odyssey",
+        }
+    }
+
+    fn default_word(self) -> &'static str {
+        match self {
+            SpikePlayer::Shakespeare => "the",
+            SpikePlayer::Bible => "And",
+            SpikePlayer::Odyssey => "of",
         }
     }
 }
 
-/// Two independently trained spike-word models that play a **zero-sum word game**.
+/// Three independently trained spike-word models in a **3-player word game**.
 ///
-/// ## Game rules
-/// - Shared board: the generated word sequence (both models observe every move).
-/// - **Player Shakespeare** (maximizer) moves on even turns: legal moves = top-k
-///   of the Shakespeare gen-policy; picks the move that maximizes game value.
-/// - **Player Bible** (minimizer) moves on odd turns: legal moves = top-k of the
-///   Bible gen-policy; picks the move that minimizes game value.
-/// - **Payoff** of playing surface word \(w\) (from maximizer's view):
-///   \(u(w)=\log p_{\mathrm{sh}}(w\mid\mathrm{ctx})-\log p_{\mathrm{bi}}(w\mid\mathrm{ctx})\).
-/// - Game value of a line is the sum of move payoffs; deeper plies are solved
-///   with perfect-information minimax (depth-limited).
+/// ## Game rules (maxⁿ, multi-player non-zero-sum)
+/// - **Shared board**: the generated word sequence; every player observes every move.
+/// - **Turn order**: Shakespeare → Bible → Odyssey → … (round-robin).
+/// - **Legal moves** for player \(i\): top-k surface words under \(i\)'s gen-policy.
+/// - **Instant payoff** to player \(i\) for playing \(w\) (before observe):
+///   \[
+///   u_i(w)=\log p_i(w\mid\mathrm{ctx}_i)
+///     -\tfrac{1}{n-1}\sum_{j\ne i}\log p_j(w\mid\mathrm{ctx}_j)
+///   \]
+///   so each agent prefers words relatively more likely under its own model.
+/// - **Search**: depth-limited **maxⁿ** — at each node the player to move picks
+///   the action maximizing **their own** component of the utility vector, assuming
+///   the others do the same on later plies (classic multi-player extension of minimax).
 ///
-/// Training of the two models is independent and runs in parallel.
-pub struct DualSpikeWordLm {
-    pub shakespeare: SpikeWordLm,
-    pub bible: SpikeWordLm,
+/// Training of the three models is independent and runs in parallel.
+pub struct TripleSpikeWordLm {
+    pub players: [SpikeWordLm; SPIKE_N_PLAYERS],
     rng: Rand,
 }
 
-impl DualSpikeWordLm {
-    pub fn new(shakespeare: SpikeWordLm, bible: SpikeWordLm, seed: u32) -> Self {
+impl TripleSpikeWordLm {
+    pub fn new(
+        shakespeare: SpikeWordLm,
+        bible: SpikeWordLm,
+        odyssey: SpikeWordLm,
+        seed: u32,
+    ) -> Self {
         Self {
-            shakespeare,
-            bible,
+            players: [shakespeare, bible, odyssey],
             rng: Rand::new(seed.max(1)),
         }
     }
 
     pub fn reset_state(&mut self) {
-        self.shakespeare.reset_state();
-        self.bible.reset_state();
+        for p in &mut self.players {
+            p.reset_state();
+        }
     }
 
-    /// Apply a shared board move: both players observe the same surface word.
+    /// Shared board move: every model observes the same surface word.
     pub fn observe_word(&mut self, word: &str) {
-        let a = self.shakespeare.vocab.encode(word);
-        let b = self.bible.vocab.encode(word);
-        self.shakespeare.observe(a);
-        self.bible.observe(b);
+        for p in &mut self.players {
+            let id = p.vocab.encode(word);
+            p.observe(id);
+        }
     }
 
-    /// Instantaneous zero-sum payoff of playing `word` in the current position
-    /// (before the move is applied). Maximizer wants this large; minimizer small.
-    fn move_payoff(sh: &SpikeWordLm, bi: &SpikeWordLm, word: &str) -> f32 {
-        sh.logp_of_word(word) - bi.logp_of_word(word)
+    /// Competitive multi-player payoffs for playing `word` (pre-observe).
+    fn move_payoffs(models: &[SpikeWordLm; SPIKE_N_PLAYERS], word: &str) -> [f32; SPIKE_N_PLAYERS] {
+        let mut lp = [0.0f32; SPIKE_N_PLAYERS];
+        for i in 0..SPIKE_N_PLAYERS {
+            lp[i] = models[i].logp_of_word(word);
+        }
+        let mut pay = [0.0f32; SPIKE_N_PLAYERS];
+        let inv = 1.0 / (SPIKE_N_PLAYERS as f32 - 1.0);
+        for i in 0..SPIKE_N_PLAYERS {
+            let mut others = 0.0f32;
+            for j in 0..SPIKE_N_PLAYERS {
+                if j != i {
+                    others += lp[j];
+                }
+            }
+            pay[i] = lp[i] - inv * others;
+        }
+        pay
     }
 
-    /// Legal moves for the player to move: top-k under that player's policy.
-    fn legal_moves(sh: &SpikeWordLm, bi: &SpikeWordLm, player: SpikePlayer) -> Vec<String> {
-        let model = match player {
-            SpikePlayer::Shakespeare => sh,
-            SpikePlayer::Bible => bi,
-        };
+    fn legal_moves(model: &SpikeWordLm) -> Vec<String> {
         let probs = model.gen_policy();
         let ids = SpikeWordLm::top_k_actions(&probs, SPIKE_MINIMAX_TOP_K);
         ids.into_iter()
@@ -3265,124 +3298,108 @@ impl DualSpikeWordLm {
             .collect()
     }
 
-    /// Depth-limited minimax from the position with `player` to move.
-    ///
-    /// Returns `(game_value, best_move)` where `game_value` is the maximizer's
-    /// (Shakespeare) utility of the subgame.
-    fn minimax(
-        sh: &mut SpikeWordLm,
-        bi: &mut SpikeWordLm,
-        player: SpikePlayer,
-        depth: usize,
-    ) -> (f32, Option<String>) {
-        // Terminal: no further plies — no remaining path payoff.
-        if depth == 0 {
-            return (0.0, None);
-        }
-
-        let moves = Self::legal_moves(sh, bi, player);
-        if moves.is_empty() {
-            return (0.0, None);
-        }
-
-        let snap_sh = sh.snapshot_spike();
-        let snap_bi = bi.snapshot_spike();
-        let maximizing = player.is_maximizer();
-
-        let mut best_move: Option<String> = None;
-        let mut best_val = if maximizing {
-            f32::NEG_INFINITY
-        } else {
-            f32::INFINITY
-        };
-
-        for word in &moves {
-            let pay = Self::move_payoff(sh, bi, word);
-            // Both agents update their board state with the shared token.
-            sh.observe(sh.vocab.encode(word));
-            bi.observe(bi.vocab.encode(word));
-            let (rest, _) = Self::minimax(sh, bi, player.other(), depth - 1);
-            let value = pay + rest;
-
-            sh.restore_spike(&snap_sh);
-            bi.restore_spike(&snap_bi);
-
-            let better = if maximizing {
-                value > best_val + 1e-9
-            } else {
-                value < best_val - 1e-9
-            };
-            if better || best_move.is_none() {
-                best_val = value;
-                best_move = Some(word.clone());
-            }
-        }
-
-        (best_val, best_move)
+    fn snapshot_all(models: &[SpikeWordLm; SPIKE_N_PLAYERS]) -> [SpikeWordSnap; SPIKE_N_PLAYERS] {
+        [
+            models[0].snapshot_spike(),
+            models[1].snapshot_spike(),
+            models[2].snapshot_spike(),
+        ]
     }
 
-    /// Choose the move for `player` by depth-limited minimax (optional soft root).
+    fn restore_all(models: &mut [SpikeWordLm; SPIKE_N_PLAYERS], snaps: &[SpikeWordSnap; SPIKE_N_PLAYERS]) {
+        for i in 0..SPIKE_N_PLAYERS {
+            models[i].restore_spike(&snaps[i]);
+        }
+    }
+
+    /// Depth-limited maxⁿ. Returns utility vector for all players and best move
+    /// for `to_move` (if any).
+    fn maxn(
+        models: &mut [SpikeWordLm; SPIKE_N_PLAYERS],
+        to_move: SpikePlayer,
+        depth: usize,
+    ) -> ([f32; SPIKE_N_PLAYERS], Option<String>) {
+        if depth == 0 {
+            return ([0.0; SPIKE_N_PLAYERS], None);
+        }
+
+        let moves = Self::legal_moves(&models[to_move.index()]);
+        if moves.is_empty() {
+            return ([0.0; SPIKE_N_PLAYERS], None);
+        }
+
+        let snaps = Self::snapshot_all(models);
+        let pi = to_move.index();
+        let mut best_u = [f32::NEG_INFINITY; SPIKE_N_PLAYERS];
+        let mut best_word: Option<String> = None;
+
+        for word in &moves {
+            let pay = Self::move_payoffs(models, word);
+            for m in models.iter_mut() {
+                let id = m.vocab.encode(word);
+                m.observe(id);
+            }
+            let (rest, _) = Self::maxn(models, to_move.next(), depth - 1);
+            let mut total = [0.0f32; SPIKE_N_PLAYERS];
+            for i in 0..SPIKE_N_PLAYERS {
+                total[i] = pay[i] + rest[i];
+            }
+            Self::restore_all(models, &snaps);
+
+            if best_word.is_none() || total[pi] > best_u[pi] + 1e-9 {
+                best_u = total;
+                best_word = Some(word.clone());
+            }
+        }
+
+        (best_u, best_word)
+    }
+
+    /// Choose the move for `player` via maxⁿ (optional soft root over own utility).
     pub fn select_move(&mut self, player: SpikePlayer, temperature: f32) -> String {
         let depth = SPIKE_MINIMAX_DEPTH.max(1);
-        let moves = Self::legal_moves(&self.shakespeare, &self.bible, player);
+        let moves = Self::legal_moves(&self.players[player.index()]);
         if moves.is_empty() {
-            return match player {
-                SpikePlayer::Shakespeare => "the".to_string(),
-                SpikePlayer::Bible => "And".to_string(),
-            };
+            return player.default_word().to_string();
         }
 
-        let snap_sh = self.shakespeare.snapshot_spike();
-        let snap_bi = self.bible.snapshot_spike();
-        let maximizing = player.is_maximizer();
-
+        let snaps = Self::snapshot_all(&self.players);
+        let pi = player.index();
         let mut scored: Vec<(String, f32)> = Vec::with_capacity(moves.len());
-        for word in &moves {
-            let pay = Self::move_payoff(&self.shakespeare, &self.bible, word);
-            self.shakespeare
-                .observe(self.shakespeare.vocab.encode(word));
-            self.bible.observe(self.bible.vocab.encode(word));
-            let (rest, _) =
-                Self::minimax(&mut self.shakespeare, &mut self.bible, player.other(), depth - 1);
-            scored.push((word.clone(), pay + rest));
-            self.shakespeare.restore_spike(&snap_sh);
-            self.bible.restore_spike(&snap_bi);
-        }
-        self.shakespeare.restore_spike(&snap_sh);
-        self.bible.restore_spike(&snap_bi);
 
-        // Greedy perfect play at the root (or soft-max over values).
+        for word in &moves {
+            let pay = Self::move_payoffs(&self.players, word);
+            for m in self.players.iter_mut() {
+                let id = m.vocab.encode(word);
+                m.observe(id);
+            }
+            let (rest, _) = Self::maxn(&mut self.players, player.next(), depth - 1);
+            let u_self = pay[pi] + rest[pi];
+            scored.push((word.clone(), u_self));
+            Self::restore_all(&mut self.players, &snaps);
+        }
+        Self::restore_all(&mut self.players, &snaps);
+
         let t = temperature.max(0.0);
         if t <= 1e-3 {
-            return if maximizing {
-                scored
-                    .into_iter()
-                    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-            } else {
-                scored
-                    .into_iter()
-                    .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-            }
-            .map(|(w, _)| w)
-            .unwrap_or_else(|| "the".to_string());
+            return scored
+                .into_iter()
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(w, _)| w)
+                .unwrap_or_else(|| player.default_word().to_string());
         }
 
-        // Softmax over ±value so maximizer prefers high, minimizer prefers low.
-        let signed: Vec<f32> = scored
-            .iter()
-            .map(|(_, v)| if maximizing { *v } else { -*v })
-            .collect();
         let mut max_s = f32::NEG_INFINITY;
-        for &s in &signed {
-            if s > max_s {
-                max_s = s;
+        for &(_, v) in &scored {
+            if v > max_s {
+                max_s = v;
             }
         }
         let t = t.max(SPIKE_MINIMAX_ROOT_TEMP);
-        let mut weights = Vec::with_capacity(signed.len());
+        let mut weights = Vec::with_capacity(scored.len());
         let mut sum = 0.0f32;
-        for &s in &signed {
-            let w = ((s - max_s) / t).exp();
+        for &(_, v) in &scored {
+            let w = ((v - max_s) / t).exp();
             weights.push(w);
             sum += w;
         }
@@ -3397,18 +3414,14 @@ impl DualSpikeWordLm {
         scored
             .last()
             .map(|(w, _)| w.clone())
-            .unwrap_or_else(|| "the".to_string())
+            .unwrap_or_else(|| player.default_word().to_string())
     }
 
-    /// Play `n` moves of the two-player game after priming on `prompt`.
-    ///
-    /// Turn order: Shakespeare (max), Bible (min), Shakespeare, …
-    /// Returns the full transcript; optional `trace` records who played each move.
     pub fn generate(&mut self, prompt: &str, n: usize, temperature: f32) -> String {
         self.generate_game(prompt, n, temperature, false).0
     }
 
-    /// Like [`generate`], but can print a per-move player trace.
+    /// Play `n` plies after priming on `prompt`. Turn order: Sh → Bi → Od → …
     pub fn generate_game(
         &mut self,
         prompt: &str,
@@ -3429,11 +3442,7 @@ impl DualSpikeWordLm {
 
         let mut moves: Vec<(SpikePlayer, String)> = Vec::with_capacity(n);
         for i in 0..n {
-            let player = if i % 2 == 0 {
-                SpikePlayer::Shakespeare
-            } else {
-                SpikePlayer::Bible
-            };
+            let player = SpikePlayer::from_index(i);
             let word = self.select_move(player, temperature);
             if verbose {
                 println!("  move {i}: {} plays «{word}»", player.name());
@@ -3594,10 +3603,24 @@ fn train_spike_model_on_tokens(
     (model, train_stats, eval_stats)
 }
 
-/// Dual spike-word LMs (Shakespeare + Bible), parallel train, minimax decode.
+/// Map a corpus path to a game-player label (exact ebook basenames).
+fn corpus_player_label(path: &str) -> Option<&'static str> {
+    let base = path.rsplit('/').next().unwrap_or(path);
+    if base == "100.txt.utf-8" {
+        Some("shakespeare")
+    } else if base == "10.txt.utf-8" {
+        Some("bible")
+    } else if base == "1727.txt.utf-8" {
+        Some("odyssey")
+    } else {
+        None
+    }
+}
+
+/// Triple spike-word LMs (Sh ∥ Bi ∥ Odyssey), parallel train, 3-player maxⁿ game.
 fn run_spike_word_lm(paths: &[&str]) -> Result<(), String> {
     println!();
-    println!("=== Dual spike-word LM (Shakespeare ∥ Bible; minimax decode) ===");
+    println!("=== Triple spike-word LM (Sh ∥ Bi ∥ Odyssey; 3-player maxⁿ game) ===");
     println!(
         "corpus: {}  (train={:.0}% / valid={:.0}% per source, parallel train)",
         paths.join(" + "),
@@ -3606,84 +3629,91 @@ fn run_spike_word_lm(paths: &[&str]) -> Result<(), String> {
     );
 
     let sources = load_tokenized_sources(paths)?;
-    if sources.len() < 2 {
-        return Err(
-            "dual spike LM needs at least two corpus paths (Shakespeare + Bible)".into(),
-        );
+    if sources.len() < SPIKE_N_PLAYERS {
+        return Err(format!(
+            "triple spike LM needs {} corpus paths (got {})",
+            SPIKE_N_PLAYERS,
+            sources.len()
+        ));
     }
 
-    // Map paths: prefer 100.* as Shakespeare, 10.* as Bible; else order given.
-    let mut sh_src: Option<(String, Vec<String>)> = None;
-    let mut bi_src: Option<(String, Vec<String>)> = None;
+    // Collect train/eval per labeled source.
+    let mut by_label: std::collections::HashMap<&'static str, (String, Vec<String>, Vec<String>)> =
+        std::collections::HashMap::new();
     for (path, toks) in sources {
-        let base = path.rsplit('/').next().unwrap_or(path.as_str());
-        if base.starts_with("100") || path.contains("100.txt") {
-            sh_src = Some((path, toks));
-        } else if base.starts_with("10") || path.contains("10.txt") {
-            bi_src = Some((path, toks));
-        } else if sh_src.is_none() {
-            sh_src = Some((path, toks));
-        } else {
-            bi_src = Some((path, toks));
+        let label = corpus_player_label(&path).ok_or_else(|| {
+            format!("unrecognized corpus path for 3-player game: {path}")
+        })?;
+        let (train, eval) = split_one_source(&toks, SPIKE_LM_TRAIN_FRAC);
+        println!(
+            "  {path} [{label}]: tokens={} train={} valid={}",
+            toks.len(),
+            train.len(),
+            eval.len()
+        );
+        if train.len() < 128 {
+            return Err(format!("{path}: train split too short ({})", train.len()));
+        }
+        by_label.insert(label, (path, train, eval));
+    }
+    for need in ["shakespeare", "bible", "odyssey"] {
+        if !by_label.contains_key(need) {
+            return Err(format!("missing required corpus for player '{need}'"));
         }
     }
-    let (sh_path, sh_toks) = sh_src.ok_or_else(|| "missing Shakespeare corpus".to_string())?;
-    let (bi_path, bi_toks) = bi_src.ok_or_else(|| "missing Bible corpus".to_string())?;
-
-    let (sh_train, sh_eval) = split_one_source(&sh_toks, SPIKE_LM_TRAIN_FRAC);
-    let (bi_train, bi_eval) = split_one_source(&bi_toks, SPIKE_LM_TRAIN_FRAC);
-    println!(
-        "  {sh_path}: tokens={} train={} valid={}",
-        sh_toks.len(),
-        sh_train.len(),
-        sh_eval.len()
-    );
-    println!(
-        "  {bi_path}: tokens={} train={} valid={}",
-        bi_toks.len(),
-        bi_train.len(),
-        bi_eval.len()
-    );
-    if sh_train.len() < 128 || bi_train.len() < 128 {
-        return Err("train split too short for one of the sources".into());
-    }
 
     println!(
-        "training both models in parallel (hebb_cap={SPIKE_LM_HEBB_TOKENS}, ctx_pool={SPIKE_LM_CTX_POOL})..."
+        "training 3 models in parallel (hebb_cap={SPIKE_LM_HEBB_TOKENS}, ctx_pool={SPIKE_LM_CTX_POOL})..."
     );
 
-    // Parallel train: each model owns its vocab / weights / pool.
-    let (sh_pack, bi_pack) = std::thread::scope(|scope| {
+    let (sh_t, sh_e) = {
+        let e = by_label.get("shakespeare").unwrap();
+        (e.1.clone(), e.2.clone())
+    };
+    let (bi_t, bi_e) = {
+        let e = by_label.get("bible").unwrap();
+        (e.1.clone(), e.2.clone())
+    };
+    let (od_t, od_e) = {
+        let e = by_label.get("odyssey").unwrap();
+        (e.1.clone(), e.2.clone())
+    };
+
+    let (sh_pack, bi_pack, od_pack) = std::thread::scope(|scope| {
         let sh_h = scope.spawn(|| {
-            train_spike_model_on_tokens("shakespeare", &sh_train, &sh_eval, 0x51A6E, 1)
+            train_spike_model_on_tokens("shakespeare", &sh_t, &sh_e, 0x51A6E, 1)
         });
-        let bi_h = scope.spawn(|| {
-            train_spike_model_on_tokens("bible", &bi_train, &bi_eval, 0xB1B1E, 1)
-        });
+        let bi_h =
+            scope.spawn(|| train_spike_model_on_tokens("bible", &bi_t, &bi_e, 0xB1B1E, 1));
+        let od_h =
+            scope.spawn(|| train_spike_model_on_tokens("odyssey", &od_t, &od_e, 0x0D15, 1));
         (
             sh_h.join().expect("shakespeare train thread"),
             bi_h.join().expect("bible train thread"),
+            od_h.join().expect("odyssey train thread"),
         )
     });
 
-    let (shakespeare, sh_train_stats, sh_eval_stats) = sh_pack;
-    let (bible, bi_train_stats, bi_eval_stats) = bi_pack;
+    let (shakespeare, sh_tr, sh_ev) = sh_pack;
+    let (bible, bi_tr, bi_ev) = bi_pack;
+    let (odyssey, od_tr, od_ev) = od_pack;
 
     println!(
-        "shakespeare neurons={} | bible neurons={}",
+        "players: shakespeare={} | bible={} | odyssey={} neurons",
         shakespeare.n_words(),
-        bible.n_words()
+        bible.n_words(),
+        odyssey.n_words()
     );
 
-    let mut dual = DualSpikeWordLm::new(shakespeare, bible, 0xD0A1);
+    let mut game = TripleSpikeWordLm::new(shakespeare, bible, odyssey, 0x3FAE);
     let prompt = "To be, or not to be";
     println!();
     println!(
-        "two-player minimax game: depth={SPIKE_MINIMAX_DEPTH} top_k={SPIKE_MINIMAX_TOP_K} \
-         n={SPIKE_LM_SAMPLE_WORDS}  (Shakespeare=MAX, Bible=MIN, alternate turns)"
+        "3-player maxⁿ game: depth={SPIKE_MINIMAX_DEPTH} top_k={SPIKE_MINIMAX_TOP_K} \
+         n={SPIKE_LM_SAMPLE_WORDS}  (turn order: shakespeare → bible → odyssey)"
     );
     let (sample, move_trace) =
-        dual.generate_game(prompt, SPIKE_LM_SAMPLE_WORDS, 0.0, false);
+        game.generate_game(prompt, SPIKE_LM_SAMPLE_WORDS, 0.0, false);
     println!("sample game transcript (prompt+{SPIKE_LM_SAMPLE_WORDS} plies):");
     println!("----");
     println!("{sample}");
@@ -3697,13 +3727,16 @@ fn run_spike_word_lm(paths: &[&str]) -> Result<(), String> {
     }
     println!();
     println!(
-        "{{spike_word_lm: {{\"sh_train_acc\": {:.6}, \"sh_eval_acc\": {:.6}, \"bi_train_acc\": {:.6}, \"bi_eval_acc\": {:.6}, \"sh_neurons\": {}, \"bi_neurons\": {}, \"minimax_depth\": {}, \"game\": \"sh_max_vs_bi_min\"}}}}",
-        sh_train_stats.accuracy,
-        sh_eval_stats.accuracy,
-        bi_train_stats.accuracy,
-        bi_eval_stats.accuracy,
-        dual.shakespeare.n_words(),
-        dual.bible.n_words(),
+        "{{spike_word_lm: {{\"sh_train_acc\": {:.6}, \"sh_eval_acc\": {:.6}, \"bi_train_acc\": {:.6}, \"bi_eval_acc\": {:.6}, \"od_train_acc\": {:.6}, \"od_eval_acc\": {:.6}, \"sh_neurons\": {}, \"bi_neurons\": {}, \"od_neurons\": {}, \"minimax_depth\": {}, \"game\": \"3p_maxn_sh_bi_od\"}}}}",
+        sh_tr.accuracy,
+        sh_ev.accuracy,
+        bi_tr.accuracy,
+        bi_ev.accuracy,
+        od_tr.accuracy,
+        od_ev.accuracy,
+        game.players[0].n_words(),
+        game.players[1].n_words(),
+        game.players[2].n_words(),
         SPIKE_MINIMAX_DEPTH
     );
     Ok(())
@@ -4197,21 +4230,24 @@ mod tests {
         let sample_toks = tokenize_words(sample.as_bytes());
         assert!(sample_toks.len() >= 5);
 
-        // Two-player minimax game with two small models (alternate turns).
+        // 3-player maxⁿ game with three small models (round-robin turns).
         let text2 = "cat dog fish cat dog fish cat dog fish cat dog fish ";
         let toks2 = tokenize_words(text2.as_bytes());
-        let vocab2 = WordVocab::from_tokens(&toks2);
-        let ids2 = vocab2.encode_tokens(&toks2);
-        let mut m2 = SpikeWordLm::new(vocab2, 7);
-        let _ = m2.train_ids(&ids2, 0);
-        let mut dual = DualSpikeWordLm::new(model, m2, 3);
-        let (mm, trace) = dual.generate_game("cat", 4, 0.0, false);
-        assert!(mm.split_whitespace().count() >= 3);
-        assert_eq!(trace.len(), 4);
+        let mk = |seed| {
+            let v = WordVocab::from_tokens(&toks2);
+            let ids = v.encode_tokens(&toks2);
+            let mut m = SpikeWordLm::new(v, seed);
+            let _ = m.train_ids(&ids, 0);
+            m
+        };
+        let mut game = TripleSpikeWordLm::new(model, mk(7), mk(11), 3);
+        let (mm, trace) = game.generate_game("cat", 6, 0.0, false);
+        assert!(mm.split_whitespace().count() >= 4);
+        assert_eq!(trace.len(), 6);
         assert_eq!(trace[0].0, SpikePlayer::Shakespeare);
         assert_eq!(trace[1].0, SpikePlayer::Bible);
-        assert_eq!(trace[2].0, SpikePlayer::Shakespeare);
-        assert_eq!(trace[3].0, SpikePlayer::Bible);
+        assert_eq!(trace[2].0, SpikePlayer::Odyssey);
+        assert_eq!(trace[3].0, SpikePlayer::Shakespeare);
     }
 
     #[test]
@@ -4330,12 +4366,13 @@ mod tests {
     }
 
     #[test]
-    fn test_dual_source_split_and_separate_vocabs() {
+    fn test_triple_source_split_and_separate_vocabs() {
         let sources = load_tokenized_sources(LM_CORPUS_PATHS).expect("sources");
-        assert_eq!(sources.len(), 2);
-        let mut saw_bible_vocab = false;
-        let mut saw_sh_vocab = false;
+        assert_eq!(sources.len(), 3);
+        let mut labels = std::collections::HashSet::new();
         for (path, toks) in &sources {
+            let label = corpus_player_label(path).expect("labeled corpus");
+            labels.insert(label);
             let (train, eval) = split_one_source(toks, SPIKE_LM_TRAIN_FRAC);
             assert_eq!(train.len() + eval.len(), toks.len(), "{path}");
             let frac = train.len() as f32 / toks.len() as f32;
@@ -4344,18 +4381,30 @@ mod tests {
                 "{path}: train frac {frac}"
             );
             let vocab = WordVocab::from_tokens(&train);
-            if path.contains("10.txt") {
-                saw_bible_vocab = ["LORD", "God", "Genesis", "Israel", "Moses"]
-                    .iter()
-                    .any(|w| vocab.encode(w) != vocab.unk_id());
-            }
-            if path.contains("100.txt") {
-                saw_sh_vocab = vocab.encode("the") != vocab.unk_id()
-                    || vocab.encode("The") != vocab.unk_id();
+            match label {
+                "bible" => assert!(
+                    ["LORD", "God", "Genesis", "Israel", "Moses"]
+                        .iter()
+                        .any(|w| vocab.encode(w) != vocab.unk_id()),
+                    "Bible types missing"
+                ),
+                "shakespeare" => assert!(
+                    vocab.encode("the") != vocab.unk_id()
+                        || vocab.encode("The") != vocab.unk_id()
+                ),
+                "odyssey" => assert!(
+                    ["Odysseus", "Ulysses", "Ithaca", "Athena", "Troy"]
+                        .iter()
+                        .any(|w| vocab.encode(w) != vocab.unk_id())
+                        || vocab.len() > 100,
+                    "Odyssey train vocab looks empty of content"
+                ),
+                _ => {}
             }
         }
-        assert!(saw_bible_vocab, "Bible train vocab should include Bible types");
-        assert!(saw_sh_vocab, "Shakespeare train vocab should include common words");
+        assert!(labels.contains("shakespeare"));
+        assert!(labels.contains("bible"));
+        assert!(labels.contains("odyssey"));
     }
 }
 

@@ -1166,14 +1166,20 @@ const SPIKE_LM_WOUT_CLIP: f32 = 2.5;
 const SPIKE_LM_TRAIN_FRAC: f32 = 0.9;
 /// Words to generate after the prompt.
 const SPIKE_LM_SAMPLE_WORDS: usize = 40;
-/// Softmax temperature on drive→prior for policy / minimax branching.
+/// Softmax temperature on drive→prior for policy / search branching.
 const SPIKE_POLICY_TEMP: f32 = 0.65;
-/// Minimax search depth (plies). Even depths end on maximizer-aligned leaves.
+/// Minimax / maxⁿ search depth (plies) for the adversarial game mode.
 const SPIKE_MINIMAX_DEPTH: usize = 2;
-/// Branching factor: top-k actions per model at each minimax node.
+/// Branching factor: top-k actions per model at each search node.
 const SPIKE_MINIMAX_TOP_K: usize = 8;
-/// Softmax temperature when sampling among near-tied minimax root actions (0 = greedy).
+/// Softmax temperature when sampling among near-tied root actions (0 = greedy).
 const SPIKE_MINIMAX_ROOT_TEMP: f32 = 0.15;
+/// Beam width for cooperative multi-agent beam search.
+const SPIKE_BEAM_WIDTH: usize = 6;
+/// Per-model top-k folded into the cooperative candidate union each step.
+const SPIKE_BEAM_CAND_K: usize = 8;
+/// Mild penalty (nats) for immediately repeating the previous surface word in beam search.
+const SPIKE_BEAM_REPEAT_PENALTY: f32 = 0.75;
 
 /// Keep printable ASCII + newline (maps curly quotes etc. away upstream).
 fn is_lm_byte(b: u8) -> bool {
@@ -3221,26 +3227,32 @@ impl SpikePlayer {
     }
 }
 
-/// Three independently trained spike-word models in a **3-player word game**.
+/// Three independently trained spike-word models.
 ///
-/// ## Game rules (maxⁿ, multi-player non-zero-sum)
-/// - **Shared board**: the generated word sequence; every player observes every move.
-/// - **Turn order**: Shakespeare → Bible → Odyssey → … (round-robin).
-/// - **Legal moves** for player \(i\): top-k surface words under \(i\)'s gen-policy.
-/// - **Instant payoff** to player \(i\) for playing \(w\) (before observe):
-///   \[
-///   u_i(w)=\log p_i(w\mid\mathrm{ctx}_i)
-///     -\tfrac{1}{n-1}\sum_{j\ne i}\log p_j(w\mid\mathrm{ctx}_j)
-///   \]
-///   so each agent prefers words relatively more likely under its own model.
-/// - **Search**: depth-limited **maxⁿ** — at each node the player to move picks
-///   the action maximizing **their own** component of the utility vector, assuming
-///   the others do the same on later plies (classic multi-player extension of minimax).
+/// ## Coherent generation (default)
+/// **Cooperative multi-agent beam search** with shared objective
+/// \(s(w)=\sum_i \log p_i(w\mid\mathrm{ctx}_i)\) (product of experts).
+/// All models observe every committed word (shared board).
+///
+/// ## Adversarial game mode
+/// Round-robin **maxⁿ** (Shakespeare → Bible → Odyssey), each maximizing a
+/// competitive own-vs-others payoff — see [`generate_game`].
 ///
 /// Training of the three models is independent and runs in parallel.
 pub struct TripleSpikeWordLm {
     pub players: [SpikeWordLm; SPIKE_N_PLAYERS],
     rng: Rand,
+}
+
+/// One hypothesis in cooperative beam search.
+#[derive(Clone, Debug)]
+struct CoopBeamHyp {
+    /// Generated words after the prompt.
+    words: Vec<String>,
+    /// Path score \(\sum_t s(w_t)\).
+    score: f32,
+    /// Pool / membrane state of all agents after these words.
+    snaps: [SpikeWordSnap; SPIKE_N_PLAYERS],
 }
 
 impl TripleSpikeWordLm {
@@ -3268,6 +3280,119 @@ impl TripleSpikeWordLm {
             let id = p.vocab.encode(word);
             p.observe(id);
         }
+    }
+
+    /// Cooperative step score: \(s(w)=\sum_i \log p_i(w)\) (product of experts).
+    fn joint_logp(models: &[SpikeWordLm; SPIKE_N_PLAYERS], word: &str) -> f32 {
+        let mut s = 0.0f32;
+        for m in models {
+            s += m.logp_of_word(word);
+        }
+        s
+    }
+
+    /// Union of each model's top-k surface words (shared candidate set).
+    fn union_candidates(models: &[SpikeWordLm; SPIKE_N_PLAYERS], k: usize) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for m in models {
+            let probs = m.gen_policy();
+            for id in SpikeWordLm::top_k_actions(&probs, k) {
+                let w = m.vocab.decode(id).to_string();
+                if seen.insert(w.clone()) {
+                    out.push(w);
+                }
+            }
+        }
+        out
+    }
+
+    /// Cooperative multi-agent **beam search** for coherent multi-model text.
+    ///
+    /// At each step expands the union of per-model top-k words, scores with
+    /// \(s(w)=\sum_i\log p_i(w)\), and keeps the best [`SPIKE_BEAM_WIDTH`] paths.
+    /// After `n` steps, restores the winning hypothesis state into `self`.
+    pub fn generate_beam(&mut self, prompt: &str, n: usize, beam_width: usize) -> String {
+        self.reset_state();
+        let prompt_tokens = tokenize_words(prompt.as_bytes());
+        let mut prompt_words: Vec<String> = if prompt_tokens.is_empty() {
+            vec!["To".to_string()]
+        } else {
+            prompt_tokens
+        };
+        for w in &prompt_words {
+            self.observe_word(w);
+        }
+
+        let width = beam_width.max(1);
+        let mut beams = vec![CoopBeamHyp {
+            words: Vec::new(),
+            score: 0.0,
+            snaps: Self::snapshot_all(&self.players),
+        }];
+
+        for _step in 0..n {
+            let mut expanded: Vec<CoopBeamHyp> = Vec::new();
+            for hyp in &beams {
+                Self::restore_all(&mut self.players, &hyp.snaps);
+                let cands =
+                    Self::union_candidates(&self.players, SPIKE_BEAM_CAND_K);
+                if cands.is_empty() {
+                    continue;
+                }
+                let prev = hyp
+                    .words
+                    .last()
+                    .cloned()
+                    .or_else(|| prompt_words.last().cloned());
+                for w in cands {
+                    Self::restore_all(&mut self.players, &hyp.snaps);
+                    let mut step_s = Self::joint_logp(&self.players, &w);
+                    if prev.as_deref() == Some(w.as_str()) {
+                        step_s -= SPIKE_BEAM_REPEAT_PENALTY;
+                    }
+                    self.observe_word(&w);
+                    let mut words = hyp.words.clone();
+                    words.push(w);
+                    expanded.push(CoopBeamHyp {
+                        words,
+                        score: hyp.score + step_s,
+                        snaps: Self::snapshot_all(&self.players),
+                    });
+                }
+            }
+            if expanded.is_empty() {
+                break;
+            }
+            expanded.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            expanded.truncate(width);
+            beams = expanded;
+        }
+
+        let best = beams
+            .into_iter()
+            .max_by(|a, b| {
+                a.score
+                    .partial_cmp(&b.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .unwrap_or(CoopBeamHyp {
+                words: Vec::new(),
+                score: 0.0,
+                snaps: Self::snapshot_all(&self.players),
+            });
+        Self::restore_all(&mut self.players, &best.snaps);
+        prompt_words.extend(best.words);
+        join_word_tokens(&prompt_words)
+    }
+
+    /// Default coherent generation: cooperative beam search.
+    pub fn generate(&mut self, prompt: &str, n: usize, _temperature: f32) -> String {
+        self.generate_beam(prompt, n, SPIKE_BEAM_WIDTH)
     }
 
     /// Competitive multi-player payoffs for playing `word` (pre-observe).
@@ -3417,11 +3542,8 @@ impl TripleSpikeWordLm {
             .unwrap_or_else(|| player.default_word().to_string())
     }
 
-    pub fn generate(&mut self, prompt: &str, n: usize, temperature: f32) -> String {
-        self.generate_game(prompt, n, temperature, false).0
-    }
-
-    /// Play `n` plies after priming on `prompt`. Turn order: Sh → Bi → Od → …
+    /// Adversarial 3-player maxⁿ game after priming on `prompt`.
+    /// Turn order: Sh → Bi → Od → …
     pub fn generate_game(
         &mut self,
         prompt: &str,
@@ -3705,18 +3827,28 @@ fn run_spike_word_lm(paths: &[&str]) -> Result<(), String> {
         odyssey.n_words()
     );
 
-    let mut game = TripleSpikeWordLm::new(shakespeare, bible, odyssey, 0x3FAE);
+    let mut ensemble = TripleSpikeWordLm::new(shakespeare, bible, odyssey, 0x3FAE);
     let prompt = "To be, or not to be";
     println!();
     println!(
-        "3-player maxⁿ game: depth={SPIKE_MINIMAX_DEPTH} top_k={SPIKE_MINIMAX_TOP_K} \
-         n={SPIKE_LM_SAMPLE_WORDS}  (turn order: shakespeare → bible → odyssey)"
+        "cooperative beam search: width={SPIKE_BEAM_WIDTH} cand_k={SPIKE_BEAM_CAND_K} \
+         n={SPIKE_LM_SAMPLE_WORDS}  (score = Σ_i log p_i)"
     );
-    let (sample, move_trace) =
-        game.generate_game(prompt, SPIKE_LM_SAMPLE_WORDS, 0.0, false);
-    println!("sample game transcript (prompt+{SPIKE_LM_SAMPLE_WORDS} plies):");
+    let sample = ensemble.generate_beam(prompt, SPIKE_LM_SAMPLE_WORDS, SPIKE_BEAM_WIDTH);
+    println!("sample cooperative-beam (prompt+{SPIKE_LM_SAMPLE_WORDS} words):");
     println!("----");
     println!("{sample}");
+    println!("----");
+
+    // Optional short adversarial game sample for comparison.
+    println!();
+    println!(
+        "3-player maxⁿ game (adversarial): depth={SPIKE_MINIMAX_DEPTH} top_k={SPIKE_MINIMAX_TOP_K} n=12"
+    );
+    let (game_sample, move_trace) = ensemble.generate_game(prompt, 12, 0.0, false);
+    println!("sample game transcript (prompt+12 plies):");
+    println!("----");
+    println!("{game_sample}");
     println!("----");
     print!("move order: ");
     for (i, (player, w)) in move_trace.iter().enumerate() {
@@ -3727,17 +3859,17 @@ fn run_spike_word_lm(paths: &[&str]) -> Result<(), String> {
     }
     println!();
     println!(
-        "{{spike_word_lm: {{\"sh_train_acc\": {:.6}, \"sh_eval_acc\": {:.6}, \"bi_train_acc\": {:.6}, \"bi_eval_acc\": {:.6}, \"od_train_acc\": {:.6}, \"od_eval_acc\": {:.6}, \"sh_neurons\": {}, \"bi_neurons\": {}, \"od_neurons\": {}, \"minimax_depth\": {}, \"game\": \"3p_maxn_sh_bi_od\"}}}}",
+        "{{spike_word_lm: {{\"sh_train_acc\": {:.6}, \"sh_eval_acc\": {:.6}, \"bi_train_acc\": {:.6}, \"bi_eval_acc\": {:.6}, \"od_train_acc\": {:.6}, \"od_eval_acc\": {:.6}, \"sh_neurons\": {}, \"bi_neurons\": {}, \"od_neurons\": {}, \"beam_width\": {}, \"decode\": \"cooperative_beam\"}}}}",
         sh_tr.accuracy,
         sh_ev.accuracy,
         bi_tr.accuracy,
         bi_ev.accuracy,
         od_tr.accuracy,
         od_ev.accuracy,
-        game.players[0].n_words(),
-        game.players[1].n_words(),
-        game.players[2].n_words(),
-        SPIKE_MINIMAX_DEPTH
+        ensemble.players[0].n_words(),
+        ensemble.players[1].n_words(),
+        ensemble.players[2].n_words(),
+        SPIKE_BEAM_WIDTH
     );
     Ok(())
 }
@@ -4230,7 +4362,7 @@ mod tests {
         let sample_toks = tokenize_words(sample.as_bytes());
         assert!(sample_toks.len() >= 5);
 
-        // 3-player maxⁿ game with three small models (round-robin turns).
+        // Cooperative beam + 3-player game on three small models.
         let text2 = "cat dog fish cat dog fish cat dog fish cat dog fish ";
         let toks2 = tokenize_words(text2.as_bytes());
         let mk = |seed| {
@@ -4240,8 +4372,13 @@ mod tests {
             let _ = m.train_ids(&ids, 0);
             m
         };
-        let mut game = TripleSpikeWordLm::new(model, mk(7), mk(11), 3);
-        let (mm, trace) = game.generate_game("cat", 6, 0.0, false);
+        let mut triple = TripleSpikeWordLm::new(model, mk(7), mk(11), 3);
+        let beam = triple.generate_beam("cat", 6, 3);
+        assert!(
+            beam.contains("dog") || beam.contains("fish") || beam.contains("cat"),
+            "beam sample: {beam:?}"
+        );
+        let (mm, trace) = triple.generate_game("cat", 6, 0.0, false);
         assert!(mm.split_whitespace().count() >= 4);
         assert_eq!(trace.len(), 6);
         assert_eq!(trace[0].0, SpikePlayer::Shakespeare);

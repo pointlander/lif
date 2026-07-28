@@ -153,6 +153,7 @@ const SPIKE_STD_RESET: f32 = 0.45;
 const REC_TAPS: usize = 4;
 
 /// Legacy alias used by a few tests that need a small positive stddev seed.
+#[cfg(test)]
 const STD_MIN: f32 = 0.05;
 
 /// Hidden LIF units in the reservoir ensemble.
@@ -1068,11 +1069,12 @@ const LM_BLOCK_SIZE: usize = 24;
 /// Project ensemble membranes to this dim before forming the adjacency Gram
 /// (keeps RF feature size manageable: K(K+1)/2 + K).
 const LM_ADJ_PROJ: usize = 12;
-/// Default single-file corpus (Shakespeare, Project Gutenberg eBook #100).
-const LM_CORPUS_PATH: &str = "100.txt.utf-8";
-/// Training corpora for character LM (concat) and dual spike (per-source models).
+/// Training corpora for character LM (concat) and triple spike (per-source models).
 /// 100 = Shakespeare, 10 = KJV Bible, 1727 = Odyssey (Project Gutenberg).
 const LM_CORPUS_PATHS: &[&str] = &["100.txt.utf-8", "10.txt.utf-8", "1727.txt.utf-8"];
+/// Shakespeare-only path (unit tests that load a single corpus prefix).
+#[cfg(test)]
+const LM_CORPUS_PATH: &str = LM_CORPUS_PATHS[0];
 /// Characters used when streaming the reservoir for RF feature collection.
 const LM_TRAIN_CHARS: usize = 700_000;
 /// Held-out window immediately after the train prefix.
